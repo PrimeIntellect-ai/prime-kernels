@@ -1,0 +1,11 @@
+__pycache__/
+*.py[cod]
+
+# Build artifacts of the CUDA extensions
+*.so
+build/
+dist/
+*.egg-info/
+.eggs/
+
+.venv/
