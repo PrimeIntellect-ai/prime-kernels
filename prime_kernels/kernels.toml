@@ -20,3 +20,20 @@ sources = [
 include-dirs = ["csrc/kernels"]
 arch = ["10.0a"]
 cxx-std = 20
+
+[rmsnorm]
+description = "Fused RMSNorm + residual, quantized to MXFP8"
+ops = "prime_rmsnorm"
+sources = [
+    "csrc/torch_interface.cpp",
+    "rmsnorm.cu",
+    "src/kernels/rmsnorm_00_baseline.cu",
+    "src/kernels/rmsnorm_01_loop_epi.cu",
+    "src/kernels/rmsnorm_02_fixed_c.cu",
+    "src/kernels/rmsnorm_03_fixed_32pt.cu",
+    "src/kernels/rmsnorm_04_pers_32pt.cu",
+    "src/kernels/rmsnorm_05_tma.cu",
+]
+include-dirs = [".", "src/include"]
+arch = ["10.0a", "12.0a"]
+cxx-std = 20

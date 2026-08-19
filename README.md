@@ -9,10 +9,15 @@ CUDA kernels for Prime Intellect training stacks, shipped as one wheel, `prime-k
     ├── kernels.toml          # the manifest: one table per kernel
     ├── __init__.py           # registry: is_available / load / status
     ├── _spec.py              # manifest parser (build time + runtime)
-    └── flash_moe/            # one folder per kernel
-        ├── __init__.py       # Python surface: op wrappers, fake tensors
-        ├── mxfp8.py
-        └── csrc/             # the C++/CUDA sources compiled into prime_kernels.flash_moe._C
+    ├── flash_moe/            # one folder per kernel
+    │   ├── __init__.py       # Python surface: op wrappers, fake tensors
+    │   ├── mxfp8.py
+    │   └── csrc/             # the C++/CUDA sources compiled into prime_kernels.flash_moe._C
+    └── rmsnorm/
+        ├── __init__.py
+        ├── csrc/             # the torch binding
+        ├── src/              # the kernel variants
+        └── CMakeLists.txt    # + bench.cu, test.cu: a standalone harness, see its README
 ```
 
 The repo root is the wheel: `setup.py` and `pyproject.toml` sit here, and `prime_kernels/`
@@ -38,6 +43,9 @@ if prime_kernels.is_available("flash_moe"):
 
 `prime_kernels.status()` maps every kernel to `"available"` or the reason it is not.
 
+`rmsnorm` fuses RMSNorm, the residual add and the MXFP8 quantization of the result into one
+kernel, and returns the scales already in the blocked layout a tensor core GEMM reads.
+
 `flash_moe` is used by prime-rl's MoE layers under `model.moe_fused_kernel=true`, which
 resolves the kernel during model setup so an unusable install fails before training starts.
 It picks `fused_moe_mxfp8` when the run also quantizes the experts to MXFP8 and
@@ -60,7 +68,9 @@ turns a skip into an error (prime-rl's release workflow sets it).
 
 ## Adding a kernel
 
-1. Commit the sources under `prime_kernels/<name>/csrc/`.
+1. Commit the sources under `prime_kernels/<name>/csrc/`. (Paths in the manifest are free
+   form, so a kernel that comes with its own dev harness may keep that harness's layout —
+   `rmsnorm` does, and puts only the torch binding in `csrc/`.)
 2. Add a table to `prime_kernels/kernels.toml` (paths relative to the kernel folder):
 
 ```toml
