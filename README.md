@@ -44,7 +44,9 @@ if prime_kernels.is_available("flash_moe"):
 `prime_kernels.status()` maps every kernel to `"available"` or the reason it is not.
 
 `rmsnorm` fuses RMSNorm, the residual add and the MXFP8 quantization of the result into one
-kernel, and returns the scales already in the blocked layout a tensor core GEMM reads.
+kernel, and returns the scales already in the blocked layout a tensor core GEMM reads. Only
+its sources are committed for now — its table in `kernels.toml` is commented out, so it is
+neither built nor shipped in the wheel, and the registry does not list it.
 
 `flash_moe` is used by prime-rl's MoE layers under `model.moe_fused_kernel=true`, which
 resolves the kernel during model setup so an unusable install fails before training starts.
