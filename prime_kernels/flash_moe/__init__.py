@@ -3,14 +3,32 @@ from __future__ import annotations
 import torch
 
 from . import _C  # noqa: F401  # imported for its side effect: registers the prime_moe ops
+from .mxfp8 import BLOCK as MXFP8_SCALE_BLOCK
 from .mxfp8 import pack_scales_blocked
 
 __all__ = [
+    "BLOCK_M",
+    "MXFP8_SCALE_BLOCK",
     "fused_moe_bf16",
     "fused_moe_mxfp8",
     "moe_align",
     "pack_scales_blocked",
+    "unsupported_shape_reason",
 ]
+
+BLOCK_M = 128
+
+def unsupported_shape_reason(dim: int, hidden_dim: int, *, mxfp8: bool = False, split: bool = True) -> str | None:
+    if hidden_dim % BLOCK_M:
+        return (
+            f"hidden_dim {hidden_dim} must be a multiple of {BLOCK_M}: the MMA tile spans "
+            f"{2 * BLOCK_M} columns of the concatenated gate/up projection"
+        )
+    k_align = 256 if mxfp8 or split else 128
+    if dim % k_align:
+        which = "mxfp8" if mxfp8 else ("split bf16" if split else "bf16")
+        return f"dim {dim} must be a multiple of {k_align} on the {which} path"
+    return None
 
 
 @torch.library.register_fake("prime_moe::moe_align")
@@ -103,18 +121,6 @@ def fused_moe_bf16(
     cpc: int = 1,
     split: bool = True,
 ) -> torch.Tensor:
-    """Fused bf16 MoE. Writes into `out` in place and returns it.
-
-    `w` is the gate/up projection as plain contiguous `(E, N, K)`, gate in the first half of
-    N and up in the second. The kernel interleaves the two halves through its tensor map, so
-    do not pre-interleave them on the host.
-
-    `split` materializes the intermediate activation in a scratch buffer and runs the down
-    projection as a second kernel, which removes the split-K reduction over `out` — it zeroes
-    `out` itself and requires `stages <= 4`. With `split=False` the whole thing stays on chip
-    and accumulates into `out` through global reductions, so `out` must be zeroed by the
-    caller.
-    """
     torch.ops.prime_moe.fused_moe_bf16(
         x,
         w,

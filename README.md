@@ -24,7 +24,7 @@ The repo root is the wheel: `setup.py` and `pyproject.toml` sit here, and `prime
 is the package you import. A kernel folder holds both halves of one kernel — its Python
 surface and, under `csrc/`, the sources compiled into `prime_kernels.<name>._C`.
 
-This repo is consumed as a git submodule at `kernels/` in
+This repo is consumed as a git submodule at `deps/prime-kernels/` in
 [prime-rl](https://github.com/PrimeIntellect-ai/prime-rl), which builds and publishes the
 prebuilt wheels with its releases.
 
@@ -85,8 +85,20 @@ arch = ["10.0a"]       # compute capabilities to compile for; exact match at run
 cxx-std = 20
 ```
 
-3. Add `prime_kernels/<name>/__init__.py`: `from . import _C` plus wrappers and
-   `torch.library.register_fake` for each op.
+3. Add `prime_kernels/<name>/__init__.py`: `from . import _C` plus, per op, a wrapper
+   calling `torch.ops.<ns>.<op>` and a `torch.library.register_fake`. No
+   `torch.library.custom_op` decorator — that is how a *Python* op is defined, and
+   `TORCH_LIBRARY` has already defined these ops C++ side; only the fake (meta) kernel is
+   missing, since C++ registers no meta implementation. An op used in training also needs
+   `torch.library.register_autograd`: a schema carries no backward, so without it autograd
+   treats the op as non-differentiable. `flash_moe` is the exception — it is forward only,
+   and prime-rl wraps it in its own `autograd.Function`.
+
+Whatever the kernel requires of its inputs — block sizes, alignments, layouts — belongs
+here, not in the caller: `TORCH_CHECK` it in the binding, and export the constants
+(e.g. `flash_moe.BLOCK_M`) and any setup-time predicate (`unsupported_shape_reason`) from
+the kernel's `__init__.py`. A caller hardcoding `128` means every requirement change is a
+two-repo change.
 
 The extension is always named `prime_kernels.<name>._C`, so the C++ side must define
 `PYBIND11_MODULE(_C, m)` (ops themselves should be registered with `TORCH_LIBRARY*`).

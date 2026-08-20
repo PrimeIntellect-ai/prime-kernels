@@ -132,6 +132,9 @@ namespace pi {
         TORCH_CHECK(x.size(0));
         TORCH_CHECK(x.size(1) == w.size(2));
         TORCH_CHECK((x.size(1)&127) == 0, "K dimension must be a multiple of 128");
+        TORCH_CHECK((w.size(1)&255) == 0, "N dimension must be a multiple of 256: the MMA tile spans 256 columns of the concatenated gate/up projection");
+        TORCH_CHECK(!split || (x.size(1)&255) == 0, "split=True runs the down projection as its own kernel, which tiles 256 columns of K");
+        TORCH_CHECK(w2.size(0) == w.size(0) && w2.size(1) == x.size(1) && w2.size(2) == w.size(1)/2, "w2 must be (E, K, N/2)");
         TORCH_CHECK((block_n == 64 && warp_n == 4) || (block_n == 32 && warp_n == 8));
         TORCH_CHECK(stages > 0 && stages < 6);
         TORCH_CHECK(bpc == 1 && cpc == 1, "bpc=cpc=1 is the only supported configuration");
