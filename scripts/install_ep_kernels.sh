@@ -53,6 +53,16 @@ if [ -d "$CUDA_HOME/include/cccl" ]; then
     export CPATH="$CUDA_HOME/include/cccl${CPATH:+:$CPATH}"
 fi
 
+# DeepEP links -lcuda (the driver stub, not the runtime). NVIDIA's own `devel` Ubuntu
+# images conveniently symlink it onto $CUDA_HOME/lib64/stubs, but PyTorch's manylinux
+# builder images don't — the stub only exists under
+# $CUDA_HOME/targets/<arch>-linux/lib/stubs (arch-linux name varies: x86_64-linux,
+# sbsa-linux, ...). Find it rather than hardcode the arch directory name.
+STUBS_DIR=$(find "$CUDA_HOME" -maxdepth 4 -type d -name stubs 2>/dev/null | head -1)
+if [ -n "$STUBS_DIR" ]; then
+    export LIBRARY_PATH="${STUBS_DIR}${LIBRARY_PATH:+:$LIBRARY_PATH}"
+fi
+
 NVCC_VER=$("$CUDA_HOME/bin/nvcc" --version | grep -oP 'release \K[\d.]+')
 echo "Torch CUDA: ${TORCH_CUDA_VER}, nvcc: ${NVCC_VER} (${CUDA_HOME})"
 
