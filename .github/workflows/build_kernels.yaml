@@ -248,14 +248,19 @@ jobs:
     # should build and smoke-test, not publish. Without this, every push to a PR branch
     # would create and publish a real release the moment build+smoke-test go green.
     #
-    # needs.smoke-test.result tolerates 'skipped' as well as 'success': smoke-test is
-    # currently disabled (see its `if: false`) until the GPU runner is registered, and
-    # a skipped dependency fails the default needs.*-implied success() check — without
-    # this, disabling smoke-test would also silently block every release.
+    # needs['smoke-test'].result tolerates 'skipped' as well as 'success': smoke-test
+    # is currently disabled (see its `if: false`) until the GPU runner is registered,
+    # and a skipped dependency fails the default needs.*-implied success() check —
+    # without this, disabling smoke-test would also silently block every release.
+    #
+    # Bracket notation is required, not `needs.smoke-test.result`: GitHub Actions
+    # expressions parse a bare `-` in dot-access as subtraction, not part of the name,
+    # so the dotted form silently evaluates as garbage instead of erroring — which is
+    # exactly how this job ended up skipping releases with no annotation at all.
     if: |
       github.event_name != 'pull_request' &&
       needs.build.result == 'success' &&
-      (needs.smoke-test.result == 'success' || needs.smoke-test.result == 'skipped')
+      (needs['smoke-test'].result == 'success' || needs['smoke-test'].result == 'skipped')
     runs-on: ubuntu-latest
     permissions:
       contents: write
