@@ -15,8 +15,10 @@ name: Build and Release Kernels
 # is unset, which silently scopes the wheel to whatever GPU happened to build it (that
 # bug produced a Blackwell-only deep-ep wheel once already).
 #
-# Building inside `pytorch/manylinux2_28-builder` (glibc 2.28, AlmaLinux 8), not a
-# plain Ubuntu 24.04 CUDA image: a wheel compiled against Ubuntu 24.04's glibc 2.39
+# Building inside PyTorch's manylinux builder images (glibc 2.28, AlmaLinux 8 — see
+# `build_image` per arch below; amd64 and arm64 are separate image repos, not one
+# multi-arch tag), not a plain Ubuntu 24.04 CUDA image: a wheel compiled against
+# Ubuntu 24.04's glibc 2.39
 # fails to import (`GLIBC_2.38 not found`) on anything older — e.g. Ubuntu 22.04, still
 # a common dev-box OS here. glibc symbol versioning is backwards-compatible, so a
 # glibc-2.28 build imports fine everywhere newer, including Ubuntu 24.04 itself. This is
@@ -65,10 +67,9 @@ concurrency:
 env:
   # Keep in sync with the CUDA toolkit the container images below use.
   CUDA_TAG: cu130
-  # `build`'s container (glibc 2.28, for portability — see the comment above) and
-  # `smoke-test`'s (a stand-in for the real deployment target, which is Ubuntu 24.04 —
-  # see Dockerfile.cuda in prime-rl) are deliberately different images.
-  BUILD_CONTAINER_IMAGE: pytorch/manylinux2_28-builder:cuda13.0
+  # `smoke-test`'s container is a stand-in for the real deployment target (Ubuntu 24.04
+  # — see Dockerfile.cuda in prime-rl), deliberately different from `build`'s (see the
+  # portability comment up top and the per-arch images in the `build` matrix below).
   CONTAINER_IMAGE: nvidia/cuda:13.0.3-devel-ubuntu24.04
   TORCH_VERSION: 2.13.0+cu130
 
@@ -81,15 +82,19 @@ jobs:
         kernel: [prime-kernels, deep-ep, deep-gemm, torchao]
         arch: [x86_64, aarch64]
         include:
+          # PyTorch publishes separate manylinux builder images per arch, not a
+          # multi-arch manifest under one tag — `manylinux2_28-builder` is amd64-only
+          # (confirmed: CI's aarch64 job failed to pull it with "no matching manifest
+          # for linux/arm64/v8"); `manylinuxaarch64-builder` is its aarch64 counterpart.
           - arch: x86_64
             runner: image-builder
+            build_image: pytorch/manylinux2_28-builder:cuda13.0
           - arch: aarch64
             runner: image-builder-arm-2204
+            build_image: pytorch/manylinuxaarch64-builder:cuda13.0
     runs-on: ${{ matrix.runner }}
-    # `env` isn't available in `container:` (GitHub Actions only exposes it inside
-    # steps), so this has to be a literal — keep it in sync with BUILD_CONTAINER_IMAGE
-    # above. AlmaLinux 8 (glibc 2.28), not Ubuntu — see the portability comment up top.
-    container: pytorch/manylinux2_28-builder:cuda13.0
+    # `matrix` (unlike `env`) is available in `container:`, so this can vary by arch.
+    container: ${{ matrix.build_image }}
     steps:
       # git, curl, gcc/g++/make and cmake/ninja already ship in this image (via
       # /opt/conda and gcc-toolset-13). libibverbs-devel/librdmacm-devel: NVSHMEM's
