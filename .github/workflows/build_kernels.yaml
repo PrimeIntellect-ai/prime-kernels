@@ -15,6 +15,14 @@ name: Build and Release Kernels
 # is unset, which silently scopes the wheel to whatever GPU happened to build it (that
 # bug produced a Blackwell-only deep-ep wheel once already).
 #
+# Building inside `pytorch/manylinux2_28-builder` (glibc 2.28, AlmaLinux 8), not a
+# plain Ubuntu 24.04 CUDA image: a wheel compiled against Ubuntu 24.04's glibc 2.39
+# fails to import (`GLIBC_2.38 not found`) on anything older — e.g. Ubuntu 22.04, still
+# a common dev-box OS here. glibc symbol versioning is backwards-compatible, so a
+# glibc-2.28 build imports fine everywhere newer, including Ubuntu 24.04 itself. This is
+# the same builder image PyTorch itself uses for its manylinux_2_28 wheels, matching the
+# platform tag vLLM's own prebuilt wheel already carries in `[tool.uv.sources]`.
+#
 # No GPU is needed to build: nvcc cross compiles for every architecture we ship. GPU
 # smoke tests run separately, against the built wheels, on an actual GPU runner.
 #
@@ -57,6 +65,10 @@ concurrency:
 env:
   # Keep in sync with the CUDA toolkit the container images below use.
   CUDA_TAG: cu130
+  # `build`'s container (glibc 2.28, for portability — see the comment above) and
+  # `smoke-test`'s (a stand-in for the real deployment target, which is Ubuntu 24.04 —
+  # see Dockerfile.cuda in prime-rl) are deliberately different images.
+  BUILD_CONTAINER_IMAGE: pytorch/manylinux2_28-builder:cuda13.0
   CONTAINER_IMAGE: nvidia/cuda:13.0.3-devel-ubuntu24.04
   TORCH_VERSION: 2.13.0+cu130
 
@@ -75,15 +87,16 @@ jobs:
             runner: image-builder-arm-2204
     runs-on: ${{ matrix.runner }}
     # `env` isn't available in `container:` (GitHub Actions only exposes it inside
-    # steps), so this has to be a literal — keep it in sync with CONTAINER_IMAGE above.
-    container: nvidia/cuda:13.0.3-devel-ubuntu24.04
+    # steps), so this has to be a literal — keep it in sync with BUILD_CONTAINER_IMAGE
+    # above. AlmaLinux 8 (glibc 2.28), not Ubuntu — see the portability comment up top.
+    container: pytorch/manylinux2_28-builder:cuda13.0
     steps:
-      # libibverbs-dev/librdmacm-dev: NVSHMEM's IBGDA transport headers (infiniband/mlx5dv.h),
-      # compile-time only — deep-ep dlopens the real thing at runtime.
+      # git, curl, gcc/g++/make and cmake/ninja already ship in this image (via
+      # /opt/conda and gcc-toolset-13). libibverbs-devel/librdmacm-devel: NVSHMEM's
+      # IBGDA transport headers (infiniband/mlx5dv.h), compile-time only — deep-ep
+      # dlopens the real thing at runtime. `xz` unpacks the NVSHMEM archive.
       - name: Install build tooling
-        run: |
-          apt-get update
-          apt-get install -y --no-install-recommends git curl ca-certificates build-essential gh xz-utils libibverbs-dev librdmacm-dev
+        run: dnf install -y --setopt=install_weak_deps=False ca-certificates xz libibverbs-devel librdmacm-devel
 
       - name: Checkout
         uses: actions/checkout@v5
