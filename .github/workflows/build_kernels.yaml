@@ -1,96 +1,181 @@
-name: Build Kernels
+name: Build and Release Kernels
 
-# Builds the `prime-kernels` wheel for x86_64 and aarch64. Runs on every push/PR that touches
-# the kernel sources to catch build breakage, and with `release_tag` to attach the wheels to
-# a GitHub release — which is how consumers (e.g. prime-rl's `kernels` extra) install them.
+# Builds every wheel prime-rl (and other consumers) pin via `[tool.uv.sources]`:
+# prime-kernels (this repo's own kernels.toml-declared extensions), deep-ep and
+# deep-gemm (from their pinned deepseek-ai revs), and our torchao (from the pytorch/ao
+# rev the MXFP8 training path requires). This repo is the single build+release site for
+# all four — prime-rl only consumes the resulting release, it does not build anything
+# itself (see scripts/install_ep_kernels.sh, scripts/install_deep_gemm.sh,
+# scripts/build_torchao.sh for the pinned revs).
 #
-# No GPU is needed: nvcc cross compiles for the architectures kernels.toml declares.
+# Matrix: {kernel} x {cuda: cu129, cu130} x {arch: x86_64, aarch64} — the two CUDA
+# variants are the ones torch 2.13 actually publishes that also meet DeepGEMM/DeepEP's
+# own "CUDA 12.8+" floor for Blackwell (sm_100a) compilation; cu126 (also published for
+# torch 2.13) is excluded because it's below that floor. TORCH_CUDA_ARCH_LIST is set
+# explicitly per kernel so every wheel covers Hopper + Blackwell + Blackwell Ultra — the
+# install scripts fall back to auto-detecting a single arch from `nvidia-smi` when this
+# is unset, which silently scopes the wheel to whatever GPU happened to build it (that
+# bug produced a Blackwell-only deep-ep wheel once already).
+#
+# No GPU is needed to build: nvcc cross compiles for every architecture we ship. GPU
+# smoke tests run separately, against the built wheels, on an actual GPU runner.
+#
+# Runs on every push to main and on PRs that touch the matrix inputs; `workflow_dispatch`
+# reruns it by hand (e.g. after a torch/CUDA bump, or to rebuild one rev).
 
 on:
-  pull_request:
-    paths:
-      - "prime_kernels/**"
-      - "setup.py"
-      - "pyproject.toml"
-      - ".github/workflows/build_kernels.yaml"
   push:
     branches: [main]
     paths:
       - "prime_kernels/**"
-      - "setup.py"
+      - "scripts/install_ep_kernels.sh"
+      - "scripts/install_deep_gemm.sh"
+      - "scripts/build_torchao.sh"
+      - "scripts/smoke_test.py"
+      - "pyproject.toml"
+      - ".github/workflows/build_kernels.yaml"
+  pull_request:
+    paths:
+      - "prime_kernels/**"
+      - "scripts/install_ep_kernels.sh"
+      - "scripts/install_deep_gemm.sh"
+      - "scripts/build_torchao.sh"
+      - "scripts/smoke_test.py"
       - "pyproject.toml"
       - ".github/workflows/build_kernels.yaml"
   workflow_dispatch:
     inputs:
       release_tag:
-        description: "Existing release tag to attach the wheels to (e.g. v0.2.0). Empty = artifacts only."
-        required: false
-        type: string
-      ref:
-        description: "Ref to build the kernels from. Empty = the ref the workflow was started on."
+        description: "Tag for the release (e.g. v0.2.0). Empty = auto-generate from pyproject.toml version + short SHA."
         required: false
         type: string
 
-env:
-  # The CUDA toolkit wheels are built against. Bump alongside the minimum torch/CUDA support
-  # this repo targets.
-  CUDA_TAG: cu128
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 jobs:
   build:
-    name: Build wheel (${{ matrix.arch }})
-    # Uploading the wheels to a release needs write.
-    permissions:
-      contents: write
+    name: Build ${{ matrix.kernel }} (${{ matrix.cuda }}, ${{ matrix.arch }})
     strategy:
       fail-fast: false
       matrix:
+        kernel: [prime-kernels, deep-ep, deep-gemm, torchao]
+        cuda: [cu129, cu130]
+        arch: [x86_64, aarch64]
         include:
-          - runner: image-builder
-            arch: x86_64
-          - runner: image-builder-arm-2204
+          - arch: x86_64
+            runner: image-builder
+          - arch: aarch64
+            runner: image-builder-arm-2204
+          - cuda: cu129
+            container_image: nvidia/cuda:12.9.1-devel-ubuntu24.04
+            torch_version: 2.13.0+cu129
+          - cuda: cu130
+            container_image: nvidia/cuda:13.0.3-devel-ubuntu24.04
+            torch_version: 2.13.0+cu130
+        exclude:
+          # torchao is consumed on x86_64 only (see its marker in prime-rl's
+          # pyproject.toml); aarch64 resolves the PyPI release there instead.
+          - kernel: torchao
             arch: aarch64
     runs-on: ${{ matrix.runner }}
-    container: nvidia/cuda:12.8.1-devel-ubuntu24.04
+    container: ${{ matrix.container_image }}
     steps:
+      # libibverbs-dev/librdmacm-dev: NVSHMEM's IBGDA transport headers (infiniband/mlx5dv.h),
+      # compile-time only — deep-ep dlopens the real thing at runtime.
       - name: Install build tooling
         run: |
           apt-get update
-          apt-get install -y --no-install-recommends git curl ca-certificates build-essential gh
+          apt-get install -y --no-install-recommends git curl ca-certificates build-essential gh xz-utils libibverbs-dev librdmacm-dev
 
       - name: Checkout
         uses: actions/checkout@v5
-        with:
-          ref: ${{ inputs.ref }}
 
       - name: Install uv
         run: |
           curl -LsSf https://astral.sh/uv/install.sh | env INSTALLER_NO_MODIFY_PATH=1 UV_INSTALL_DIR=/usr/local/bin sh
           uv --version
 
+      # Every kernel here is a torch C++ extension, bound to the exact torch (and thus
+      # CUDA) it was compiled against.
       - name: Create build environment
         env:
-          UV_TORCH_BACKEND: ${{ env.CUDA_TAG }}
+          UV_TORCH_BACKEND: ${{ matrix.cuda }}
         run: |
+          echo "Building against torch==${{ matrix.torch_version }}"
           uv venv --python 3.12 /tmp/build-env
-          VIRTUAL_ENV=/tmp/build-env uv pip install "torch>=2.9.0" setuptools wheel ninja
+          VIRTUAL_ENV=/tmp/build-env uv pip install "torch==${{ matrix.torch_version }}" setuptools wheel ninja cmake
 
-      # torch C++ extensions are bound to the torch and CUDA they were compiled against, so
-      # the wheel carries both in its local version.
+      # prime-kernels' own version carries the ABI it was built against (deep-ep,
+      # deep-gemm and torchao keep their upstream `+<rev>` naming; the release tag they
+      # are attached to disambiguates the ABI for those three).
       - name: Stamp ABI into the version
+        if: matrix.kernel == 'prime-kernels'
         run: |
           TORCH_VERSION=$(/tmp/build-env/bin/python -c 'import torch; print(torch.__version__.split("+")[0])')
-          LOCAL="${CUDA_TAG}torch${TORCH_VERSION}"
+          LOCAL="${{ matrix.cuda }}torch${TORCH_VERSION}"
           sed -i -E "s/^version = \"([^\"]+)\"$/version = \"\1+${LOCAL}\"/" pyproject.toml
           grep '^version' pyproject.toml
 
-      - name: Build wheel
+      - name: Build prime-kernels wheel
+        if: matrix.kernel == 'prime-kernels'
         env:
           VIRTUAL_ENV: /tmp/build-env
           CUDA_HOME: /usr/local/cuda
           PRIME_KERNELS_REQUIRE: "1"
           MAX_JOBS: "8"
-        run: uv build --wheel --no-build-isolation --out-dir dist
+        run: uv build --wheel --no-build-isolation --out-dir dist .
+
+      - name: Build deep-ep wheel
+        if: matrix.kernel == 'deep-ep'
+        env:
+          VIRTUAL_ENV: /tmp/build-env
+          TORCH_CUDA_ARCH_LIST: "9.0;10.0;10.3"
+          MAX_JOBS: "8"
+        run: |
+          export PATH="/tmp/build-env/bin:$PATH"
+          bash scripts/install_ep_kernels.sh --workspace /tmp/ep_kernels_workspace --wheel-dir "$PWD/dist"
+
+      - name: Build deep-gemm wheel
+        if: matrix.kernel == 'deep-gemm'
+        env:
+          VIRTUAL_ENV: /tmp/build-env
+          CUDA_HOME: /usr/local/cuda
+          MAX_JOBS: "8"
+        run: |
+          export PATH="/tmp/build-env/bin:$PATH"
+          bash scripts/install_deep_gemm.sh --wheel-dir dist
+
+      - name: Build torchao wheel
+        if: matrix.kernel == 'torchao'
+        env:
+          VIRTUAL_ENV: /tmp/build-env
+          CUDA_HOME: /usr/local/cuda
+          TORCH_CUDA_ARCH_LIST: "9.0a;10.0a"
+          MAX_JOBS: "8"
+        run: |
+          export PATH="/tmp/build-env/bin:$PATH"
+          bash scripts/build_torchao.sh --wheel-dir dist
+
+      # deep-ep/deep-gemm/torchao wheel names carry only their upstream `+<rev>` version —
+      # nothing distinguishes a cu129 build from a cu130 build of the same rev. Building
+      # both into the same release would otherwise clobber one with the other on upload
+      # (identical filename). prime-kernels doesn't need this: its own version already
+      # got the CUDA tag stamped in above.
+      - name: Disambiguate wheel filename by CUDA toolkit
+        if: matrix.kernel != 'prime-kernels'
+        run: |
+          /tmp/build-env/bin/python - <<'PY'
+          import pathlib
+          wheel = next(pathlib.Path("dist").glob("*.whl"))
+          name, version, rest = wheel.name.split("-", 2)
+          cuda_tag = "${{ matrix.cuda }}"
+          version += f".{cuda_tag}" if "+" in version else f"+{cuda_tag}"
+          new_name = f"{name}-{version}-{rest}"
+          wheel.rename(wheel.with_name(new_name))
+          print(f"{wheel.name} -> {new_name}")
+          PY
 
       - name: Inspect wheel
         run: |
@@ -106,21 +191,111 @@ jobs:
       - name: Upload artifact
         uses: actions/upload-artifact@v4
         with:
-          name: prime-kernels-${{ matrix.arch }}
+          name: ${{ matrix.kernel }}-${{ matrix.cuda }}-${{ matrix.arch }}
           path: dist/*.whl
           if-no-files-found: error
 
-      - name: Attach to release
-        if: inputs.release_tag != ''
+  smoke-test:
+    name: Smoke test ${{ matrix.kernel }} (${{ matrix.cuda }})
+    needs: build
+    # x86_64 only: GPU runners registered for this org today are x86_64 (see the `vm`
+    # label prime-rl's gpu_tests.yaml uses). If an aarch64 GPU runner (e.g. GB200)
+    # becomes available, add an `arch` axis here the same way `build` has one.
+    strategy:
+      fail-fast: false
+      matrix:
+        kernel: [prime-kernels, deep-ep, deep-gemm, torchao]
+        cuda: [cu129, cu130]
+        include:
+          - cuda: cu129
+            container_image: nvidia/cuda:12.9.1-devel-ubuntu24.04
+            torch_version: 2.13.0+cu129
+          - cuda: cu130
+            container_image: nvidia/cuda:13.0.3-devel-ubuntu24.04
+            torch_version: 2.13.0+cu130
+    runs-on: vm
+    container:
+      image: ${{ matrix.container_image }}
+      options: --gpus all
+    steps:
+      - name: Install runtime tooling
+        run: |
+          apt-get update
+          apt-get install -y --no-install-recommends curl ca-certificates
+
+      - name: Checkout
+        uses: actions/checkout@v5
+
+      - name: Install uv
+        run: |
+          curl -LsSf https://astral.sh/uv/install.sh | env INSTALLER_NO_MODIFY_PATH=1 UV_INSTALL_DIR=/usr/local/bin sh
+
+      - name: Download wheel
+        uses: actions/download-artifact@v4
+        with:
+          name: ${{ matrix.kernel }}-${{ matrix.cuda }}-x86_64
+          path: dist
+
+      - name: Install wheel + matching torch
+        env:
+          UV_TORCH_BACKEND: ${{ matrix.cuda }}
+        run: |
+          uv venv --python 3.12 /tmp/test-env
+          VIRTUAL_ENV=/tmp/test-env uv pip install "torch==${{ matrix.torch_version }}"
+          VIRTUAL_ENV=/tmp/test-env uv pip install dist/*.whl
+
+      - name: Run smoke test
+        run: /tmp/test-env/bin/python scripts/smoke_test.py ${{ matrix.kernel }}
+
+  release:
+    name: Publish release
+    needs: [build, smoke-test]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v5
+
+      - name: Determine release tag
+        id: tag
+        run: |
+          if [ -n "${{ inputs.release_tag }}" ]; then
+            TAG="${{ inputs.release_tag }}"
+          else
+            VERSION=$(grep -m1 '^version = ' pyproject.toml | sed -E 's/version = "(.*)"/\1/')
+            TAG="v${VERSION}-$(echo "${{ github.sha }}" | cut -c1-7)"
+          fi
+          echo "tag=$TAG" >> "$GITHUB_OUTPUT"
+
+      - name: Download all wheels
+        uses: actions/download-artifact@v4
+        with:
+          path: dist
+          pattern: "*"
+          merge-multiple: true
+
+      - name: Inspect release contents
+        run: ls -lh dist/
+
+      # Draft first, upload everything, publish last: if the upload step fails
+      # partway, the release stays a draft forever and no consumer ever sees a
+      # partial set of wheels — "atomic" from the outside.
+      - name: Create draft release
         env:
           GH_TOKEN: ${{ github.token }}
-          # gh must not resolve the repo from the checkout: inside the container the
-          # workspace is owned by another uid, which git rejects as dubious ownership.
-          GH_REPO: ${{ github.repository }}
-          TAG: ${{ inputs.release_tag }}
         run: |
-          gh release upload "$TAG" dist/*.whl --clobber
-          # Consumers' `[tool.uv.sources]` pin has to name the wheel exactly, ABI suffix and all.
-          WHEEL=$(basename dist/*.whl)
-          URL="https://github.com/${GITHUB_REPOSITORY}/releases/download/${TAG}/${WHEEL}"
-          echo "\`{ url = \"$URL\", marker = \"platform_machine == '${{ matrix.arch }}'\" },\`" >> "$GITHUB_STEP_SUMMARY"
+          gh release create "${{ steps.tag.outputs.tag }}" \
+            --draft \
+            --title "${{ steps.tag.outputs.tag }}" \
+            --notes "Kernel wheels built from $(git rev-parse HEAD)."
+
+      - name: Upload wheels
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh release upload "${{ steps.tag.outputs.tag }}" dist/*.whl --clobber
+
+      - name: Publish release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh release edit "${{ steps.tag.outputs.tag }}" --draft=false
