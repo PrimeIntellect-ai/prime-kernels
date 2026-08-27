@@ -79,7 +79,9 @@ jobs:
           - kernel: torchao
             arch: aarch64
     runs-on: ${{ matrix.runner }}
-    container: ${{ env.CONTAINER_IMAGE }}
+    # `env` isn't available in `container:` (GitHub Actions only exposes it inside
+    # steps), so this has to be a literal — keep it in sync with CONTAINER_IMAGE above.
+    container: nvidia/cuda:13.0.3-devel-ubuntu24.04
     steps:
       # libibverbs-dev/librdmacm-dev: NVSHMEM's IBGDA transport headers (infiniband/mlx5dv.h),
       # compile-time only — deep-ep dlopens the real thing at runtime.
@@ -186,8 +188,10 @@ jobs:
       matrix:
         kernel: [prime-kernels, deep-ep, deep-gemm, torchao]
     runs-on: vm
+    # `env` isn't available in `container:` (GitHub Actions only exposes it inside
+    # steps), so this has to be a literal — keep it in sync with CONTAINER_IMAGE above.
     container:
-      image: ${{ env.CONTAINER_IMAGE }}
+      image: nvidia/cuda:13.0.3-devel-ubuntu24.04
       options: --gpus all
     steps:
       - name: Install runtime tooling
