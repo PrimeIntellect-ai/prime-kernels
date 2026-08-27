@@ -8,10 +8,8 @@ name: Build and Release Kernels
 # itself (see scripts/install_ep_kernels.sh, scripts/install_deep_gemm.sh,
 # scripts/build_torchao.sh for the pinned revs).
 #
-# Matrix: {kernel} x {cuda: cu129, cu130} x {arch: x86_64, aarch64} — the two CUDA
-# variants are the ones torch 2.13 actually publishes that also meet DeepGEMM/DeepEP's
-# own "CUDA 12.8+" floor for Blackwell (sm_100a) compilation; cu126 (also published for
-# torch 2.13) is excluded because it's below that floor. TORCH_CUDA_ARCH_LIST is set
+# Matrix: {kernel} x {arch: x86_64, aarch64}, all built against CUDA 13.0 (matches the
+# driver on our Blackwell fleet; see CUDA_TAG below). TORCH_CUDA_ARCH_LIST is set
 # explicitly per kernel so every wheel covers Hopper + Blackwell + Blackwell Ultra — the
 # install scripts fall back to auto-detecting a single arch from `nvidia-smi` when this
 # is unset, which silently scopes the wheel to whatever GPU happened to build it (that
@@ -20,8 +18,10 @@ name: Build and Release Kernels
 # No GPU is needed to build: nvcc cross compiles for every architecture we ship. GPU
 # smoke tests run separately, against the built wheels, on an actual GPU runner.
 #
-# Runs on every push to main and on PRs that touch the matrix inputs; `workflow_dispatch`
-# reruns it by hand (e.g. after a torch/CUDA bump, or to rebuild one rev).
+# Runs on every push to main and on PRs that touch the matrix inputs (build + smoke-test
+# only there — release is push-to-main / manual-dispatch only, see the `release` job's
+# `if`); `workflow_dispatch` reruns it by hand (e.g. after a torch/CUDA bump, or to
+# rebuild one rev).
 
 on:
   push:
@@ -54,33 +54,32 @@ concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
   cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
+env:
+  # Keep in sync with the CUDA toolkit the container images below use.
+  CUDA_TAG: cu130
+  CONTAINER_IMAGE: nvidia/cuda:13.0.3-devel-ubuntu24.04
+  TORCH_VERSION: 2.13.0+cu130
+
 jobs:
   build:
-    name: Build ${{ matrix.kernel }} (${{ matrix.cuda }}, ${{ matrix.arch }})
+    name: Build ${{ matrix.kernel }} (${{ matrix.arch }})
     strategy:
       fail-fast: false
       matrix:
         kernel: [prime-kernels, deep-ep, deep-gemm, torchao]
-        cuda: [cu129, cu130]
         arch: [x86_64, aarch64]
         include:
           - arch: x86_64
             runner: image-builder
           - arch: aarch64
             runner: image-builder-arm-2204
-          - cuda: cu129
-            container_image: nvidia/cuda:12.9.1-devel-ubuntu24.04
-            torch_version: 2.13.0+cu129
-          - cuda: cu130
-            container_image: nvidia/cuda:13.0.3-devel-ubuntu24.04
-            torch_version: 2.13.0+cu130
         exclude:
           # torchao is consumed on x86_64 only (see its marker in prime-rl's
           # pyproject.toml); aarch64 resolves the PyPI release there instead.
           - kernel: torchao
             arch: aarch64
     runs-on: ${{ matrix.runner }}
-    container: ${{ matrix.container_image }}
+    container: ${{ env.CONTAINER_IMAGE }}
     steps:
       # libibverbs-dev/librdmacm-dev: NVSHMEM's IBGDA transport headers (infiniband/mlx5dv.h),
       # compile-time only — deep-ep dlopens the real thing at runtime.
@@ -101,11 +100,11 @@ jobs:
       # CUDA) it was compiled against.
       - name: Create build environment
         env:
-          UV_TORCH_BACKEND: ${{ matrix.cuda }}
+          UV_TORCH_BACKEND: ${{ env.CUDA_TAG }}
         run: |
-          echo "Building against torch==${{ matrix.torch_version }}"
+          echo "Building against torch==${{ env.TORCH_VERSION }}"
           uv venv --python 3.12 /tmp/build-env
-          VIRTUAL_ENV=/tmp/build-env uv pip install "torch==${{ matrix.torch_version }}" setuptools wheel ninja cmake
+          VIRTUAL_ENV=/tmp/build-env uv pip install "torch==${{ env.TORCH_VERSION }}" setuptools wheel ninja cmake
 
       # prime-kernels' own version carries the ABI it was built against (deep-ep,
       # deep-gemm and torchao keep their upstream `+<rev>` naming; the release tag they
@@ -114,7 +113,7 @@ jobs:
         if: matrix.kernel == 'prime-kernels'
         run: |
           TORCH_VERSION=$(/tmp/build-env/bin/python -c 'import torch; print(torch.__version__.split("+")[0])')
-          LOCAL="${{ matrix.cuda }}torch${TORCH_VERSION}"
+          LOCAL="${{ env.CUDA_TAG }}torch${TORCH_VERSION}"
           sed -i -E "s/^version = \"([^\"]+)\"$/version = \"\1+${LOCAL}\"/" pyproject.toml
           grep '^version' pyproject.toml
 
@@ -158,25 +157,6 @@ jobs:
           export PATH="/tmp/build-env/bin:$PATH"
           bash scripts/build_torchao.sh --wheel-dir dist
 
-      # deep-ep/deep-gemm/torchao wheel names carry only their upstream `+<rev>` version —
-      # nothing distinguishes a cu129 build from a cu130 build of the same rev. Building
-      # both into the same release would otherwise clobber one with the other on upload
-      # (identical filename). prime-kernels doesn't need this: its own version already
-      # got the CUDA tag stamped in above.
-      - name: Disambiguate wheel filename by CUDA toolkit
-        if: matrix.kernel != 'prime-kernels'
-        run: |
-          /tmp/build-env/bin/python - <<'PY'
-          import pathlib
-          wheel = next(pathlib.Path("dist").glob("*.whl"))
-          name, version, rest = wheel.name.split("-", 2)
-          cuda_tag = "${{ matrix.cuda }}"
-          version += f".{cuda_tag}" if "+" in version else f"+{cuda_tag}"
-          new_name = f"{name}-{version}-{rest}"
-          wheel.rename(wheel.with_name(new_name))
-          print(f"{wheel.name} -> {new_name}")
-          PY
-
       - name: Inspect wheel
         run: |
           ls -lh dist/
@@ -191,12 +171,12 @@ jobs:
       - name: Upload artifact
         uses: actions/upload-artifact@v4
         with:
-          name: ${{ matrix.kernel }}-${{ matrix.cuda }}-${{ matrix.arch }}
+          name: ${{ matrix.kernel }}-${{ matrix.arch }}
           path: dist/*.whl
           if-no-files-found: error
 
   smoke-test:
-    name: Smoke test ${{ matrix.kernel }} (${{ matrix.cuda }})
+    name: Smoke test ${{ matrix.kernel }}
     needs: build
     # x86_64 only: GPU runners registered for this org today are x86_64 (see the `vm`
     # label prime-rl's gpu_tests.yaml uses). If an aarch64 GPU runner (e.g. GB200)
@@ -205,17 +185,9 @@ jobs:
       fail-fast: false
       matrix:
         kernel: [prime-kernels, deep-ep, deep-gemm, torchao]
-        cuda: [cu129, cu130]
-        include:
-          - cuda: cu129
-            container_image: nvidia/cuda:12.9.1-devel-ubuntu24.04
-            torch_version: 2.13.0+cu129
-          - cuda: cu130
-            container_image: nvidia/cuda:13.0.3-devel-ubuntu24.04
-            torch_version: 2.13.0+cu130
     runs-on: vm
     container:
-      image: ${{ matrix.container_image }}
+      image: ${{ env.CONTAINER_IMAGE }}
       options: --gpus all
     steps:
       - name: Install runtime tooling
@@ -233,15 +205,15 @@ jobs:
       - name: Download wheel
         uses: actions/download-artifact@v4
         with:
-          name: ${{ matrix.kernel }}-${{ matrix.cuda }}-x86_64
+          name: ${{ matrix.kernel }}-x86_64
           path: dist
 
       - name: Install wheel + matching torch
         env:
-          UV_TORCH_BACKEND: ${{ matrix.cuda }}
+          UV_TORCH_BACKEND: ${{ env.CUDA_TAG }}
         run: |
           uv venv --python 3.12 /tmp/test-env
-          VIRTUAL_ENV=/tmp/test-env uv pip install "torch==${{ matrix.torch_version }}"
+          VIRTUAL_ENV=/tmp/test-env uv pip install "torch==${{ env.TORCH_VERSION }}"
           VIRTUAL_ENV=/tmp/test-env uv pip install dist/*.whl
 
       - name: Run smoke test
@@ -250,6 +222,10 @@ jobs:
   release:
     name: Publish release
     needs: [build, smoke-test]
+    # Only cut a real release on push-to-main or an explicit manual dispatch — a PR
+    # should build and smoke-test, not publish. Without this, every push to a PR branch
+    # would create and publish a real release the moment build+smoke-test go green.
+    if: github.event_name != 'pull_request'
     runs-on: ubuntu-latest
     permissions:
       contents: write
