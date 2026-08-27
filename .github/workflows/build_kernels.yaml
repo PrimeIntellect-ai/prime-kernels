@@ -73,11 +73,6 @@ jobs:
             runner: image-builder
           - arch: aarch64
             runner: image-builder-arm-2204
-        exclude:
-          # torchao is consumed on x86_64 only (see its marker in prime-rl's
-          # pyproject.toml); aarch64 resolves the PyPI release there instead.
-          - kernel: torchao
-            arch: aarch64
     runs-on: ${{ matrix.runner }}
     # `env` isn't available in `container:` (GitHub Actions only exposes it inside
     # steps), so this has to be a literal — keep it in sync with CONTAINER_IMAGE above.
