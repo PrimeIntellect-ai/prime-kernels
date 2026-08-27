@@ -254,13 +254,17 @@ jobs:
     # without this, disabling smoke-test would also silently block every release.
     #
     # Bracket notation is required, not `needs.smoke-test.result`: GitHub Actions
-    # expressions parse a bare `-` in dot-access as subtraction, not part of the name,
-    # so the dotted form silently evaluates as garbage instead of erroring — which is
-    # exactly how this job ended up skipping releases with no annotation at all.
-    if: |
-      github.event_name != 'pull_request' &&
-      needs.build.result == 'success' &&
-      (needs['smoke-test'].result == 'success' || needs['smoke-test'].result == 'skipped')
+    # expressions parse a bare `-` in dot-access as subtraction, not part of the name.
+    #
+    # `always() &&` is required too, and is the actual reason this job kept silently
+    # skipping even once the bracket notation was fixed: GitHub Actions ANDs a job's
+    # `if` with an implicit success()-of-all-`needs` check UNLESS the expression itself
+    # calls one of always()/success()/failure()/cancelled() — so without `always()`
+    # here, smoke-test's 'skipped' result failed that hidden implicit gate before our
+    # own explicit tolerance for 'skipped' ever got evaluated. Verified empirically:
+    # https://github.com/PrimeIntellect-ai/prime-kernels/actions/runs/33123947708
+    # (four variants raced side by side; only the always()-prefixed one ran).
+    if: ${{ always() && github.event_name != 'pull_request' && needs.build.result == 'success' && (needs['smoke-test'].result == 'success' || needs['smoke-test'].result == 'skipped') }}
     runs-on: ubuntu-latest
     permissions:
       contents: write
