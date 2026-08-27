@@ -52,6 +52,10 @@ cd "$TMPDIR/DeepGEMM"
 git checkout "$DEEPGEMM_GIT_REF"
 git submodule update --init --recursive
 
+# Back to the invocation directory: a relative --wheel-dir must resolve there, not
+# inside $TMPDIR, which the EXIT trap deletes before the caller ever sees the wheel.
+cd "$REPO_ROOT"
+
 mkdir -p "$WHEEL_DIR"
 uv build --no-build-isolation --wheel --out-dir "$WHEEL_DIR" "$TMPDIR/DeepGEMM"
 echo ""
