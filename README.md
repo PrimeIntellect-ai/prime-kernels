@@ -9,10 +9,11 @@ CUDA kernels for Prime Intellect training stacks, shipped as one wheel, `prime-k
     ├── kernels.toml          # the manifest: one table per kernel
     ├── __init__.py           # registry: is_available / load / status
     ├── _spec.py              # manifest parser (build time + runtime)
-    ├── flash_moe/            # one folder per kernel
+    ├── flash_moe/            # compiled kernel
     │   ├── __init__.py       # Python surface: op wrappers, fake tensors
     │   ├── mxfp8.py
     │   └── csrc/             # the C++/CUDA sources compiled into prime_kernels.flash_moe._C
+    ├── mxfp8_moe/            # Python-only MXFP8 MoE runtime kernels
     └── rmsnorm/
         ├── __init__.py
         ├── csrc/             # the torch binding
@@ -22,7 +23,8 @@ CUDA kernels for Prime Intellect training stacks, shipped as one wheel, `prime-k
 
 The repo root is the wheel: `setup.py` and `pyproject.toml` sit here, and `prime_kernels/`
 is the package you import. A kernel folder holds both halves of one kernel — its Python
-surface and, under `csrc/`, the sources compiled into `prime_kernels.<name>._C`.
+surface and, for compiled kernels, the sources under `csrc/` compiled into
+`prime_kernels.<name>._C`.
 
 This repo is consumed as a git submodule at `deps/prime-kernels/` in
 [prime-rl](https://github.com/PrimeIntellect-ai/prime-rl), which builds and publishes the
@@ -48,10 +50,9 @@ kernel, and returns the scales already in the blocked layout a tensor core GEMM 
 its sources are committed for now — its table in `kernels.toml` is commented out, so it is
 neither built nor shipped in the wheel, and the registry does not list it.
 
-`flash_moe` is used by prime-rl's MoE layers under `model.moe_fused_kernel=true`, which
-resolves the kernel during model setup so an unusable install fails before training starts.
-It picks `fused_moe_mxfp8` when the run also quantizes the experts to MXFP8 and
-`fused_moe_bf16` otherwise.
+`flash_moe` is currently dormant in prime-rl. `mxfp8_moe` provides differentiable MXFP8
+grouped GEMM and MXFP8 expert-parallel transport. It is registered as Python-only because
+it orchestrates PyTorch and torchao kernels rather than compiling a `_C` extension here.
 
 ## Installing
 
@@ -93,6 +94,10 @@ cxx-std = 20
    `torch.library.register_autograd`: a schema carries no backward, so without it autograd
    treats the op as non-differentiable. `flash_moe` is the exception — it is forward only,
    and prime-rl wraps it in its own `autograd.Function`.
+
+For a Python-only kernel, set `python-only = true`, omit `ops` and `sources`, and expose
+the differentiable Python surface from `__init__.py`. Optional import requirements belong
+in the manifest's `requires` list so `is_available()` fails during setup.
 
 Whatever the kernel requires of its inputs — block sizes, alignments, layouts — belongs
 here, not in the caller: `TORCH_CHECK` it in the binding, and export the constants

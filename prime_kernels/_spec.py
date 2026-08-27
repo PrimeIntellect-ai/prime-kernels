@@ -57,6 +57,8 @@ class KernelSpec:
     cxx_std: int
     cxx_flags: tuple[str, ...]
     nvcc_flags: tuple[str, ...]
+    python_only: bool
+    requires: tuple[str, ...]
 
     @property
     def module(self) -> str:
@@ -82,11 +84,13 @@ def _kernel(name: str, path: Path, table: dict) -> KernelSpec:
         name=name,
         path=path,
         description=table["description"],
-        ops=table["ops"],
-        sources=tuple(path / source for source in table["sources"]),
+        ops=table.get("ops", ""),
+        sources=tuple(path / source for source in table.get("sources", [])),
         include_dirs=tuple(path / directory for directory in table.get("include-dirs", [])),
         archs=tuple(Arch.parse(arch) for arch in table["arch"]),
         cxx_std=table.get("cxx-std", 20),
         cxx_flags=tuple(table.get("cxx-flags", [])),
         nvcc_flags=tuple(table.get("nvcc-flags", [])),
+        python_only=table.get("python-only", False),
+        requires=tuple(table.get("requires", [])),
     )
