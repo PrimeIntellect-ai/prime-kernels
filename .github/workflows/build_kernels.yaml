@@ -10,10 +10,11 @@ name: Build and Release Kernels
 #
 # Matrix: {kernel} x {arch: x86_64, aarch64}, all built against CUDA 13.0 (matches the
 # driver on our Blackwell fleet; see CUDA_TAG below). TORCH_CUDA_ARCH_LIST is set
-# explicitly per kernel so every wheel covers Hopper + Blackwell + Blackwell Ultra — the
-# install scripts fall back to auto-detecting a single arch from `nvidia-smi` when this
-# is unset, which silently scopes the wheel to whatever GPU happened to build it (that
-# bug produced a Blackwell-only deep-ep wheel once already).
+# explicitly per kernel so every wheel covers Hopper + datacenter Blackwell + Blackwell
+# Ultra + workstation/consumer Blackwell (sm_120, e.g. RTX PRO 6000) — the install
+# scripts fall back to auto-detecting a single arch from `nvidia-smi` when this is
+# unset, which silently scopes the wheel to whatever GPU happened to build it (that bug
+# produced a Blackwell-only deep-ep wheel once already).
 #
 # Building inside PyTorch's manylinux builder images (glibc 2.28, AlmaLinux 8 — see
 # `build_image` per arch below; amd64 and arm64 are separate image repos, not one
@@ -145,7 +146,7 @@ jobs:
         if: matrix.kernel == 'deep-ep'
         env:
           VIRTUAL_ENV: /tmp/build-env
-          TORCH_CUDA_ARCH_LIST: "9.0;10.0;10.3"
+          TORCH_CUDA_ARCH_LIST: "9.0;10.0;10.3;12.0"
           MAX_JOBS: "8"
         run: |
           export PATH="/tmp/build-env/bin:$PATH"
