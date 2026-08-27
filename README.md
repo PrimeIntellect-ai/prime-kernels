@@ -24,9 +24,11 @@ The repo root is the wheel: `setup.py` and `pyproject.toml` sit here, and `prime
 is the package you import. A kernel folder holds both halves of one kernel — its Python
 surface and, under `csrc/`, the sources compiled into `prime_kernels.<name>._C`.
 
-This repo is consumed as a git submodule at `deps/prime-kernels/` in
-[prime-rl](https://github.com/PrimeIntellect-ai/prime-rl), which builds and publishes the
-prebuilt wheels with its releases.
+This repo builds and publishes its own prebuilt wheels via
+[`build_kernels.yaml`](.github/workflows/build_kernels.yaml). It is also consumed as a git
+submodule at `deps/prime-kernels/` in
+[prime-rl](https://github.com/PrimeIntellect-ai/prime-rl), which pins a commit for source
+builds and a released wheel for installs.
 
 ## Using a kernel
 

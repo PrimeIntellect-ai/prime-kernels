@@ -1,0 +1,126 @@
+name: Build Kernels
+
+# Builds the `prime-kernels` wheel for x86_64 and aarch64. Runs on every push/PR that touches
+# the kernel sources to catch build breakage, and with `release_tag` to attach the wheels to
+# a GitHub release — which is how consumers (e.g. prime-rl's `kernels` extra) install them.
+#
+# No GPU is needed: nvcc cross compiles for the architectures kernels.toml declares.
+
+on:
+  pull_request:
+    paths:
+      - "prime_kernels/**"
+      - "setup.py"
+      - "pyproject.toml"
+      - ".github/workflows/build_kernels.yaml"
+  push:
+    branches: [main]
+    paths:
+      - "prime_kernels/**"
+      - "setup.py"
+      - "pyproject.toml"
+      - ".github/workflows/build_kernels.yaml"
+  workflow_dispatch:
+    inputs:
+      release_tag:
+        description: "Existing release tag to attach the wheels to (e.g. v0.2.0). Empty = artifacts only."
+        required: false
+        type: string
+      ref:
+        description: "Ref to build the kernels from. Empty = the ref the workflow was started on."
+        required: false
+        type: string
+
+env:
+  # The CUDA toolkit wheels are built against. Bump alongside the minimum torch/CUDA support
+  # this repo targets.
+  CUDA_TAG: cu128
+
+jobs:
+  build:
+    name: Build wheel (${{ matrix.arch }})
+    # Uploading the wheels to a release needs write.
+    permissions:
+      contents: write
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner: image-builder
+            arch: x86_64
+          - runner: image-builder-arm-2204
+            arch: aarch64
+    runs-on: ${{ matrix.runner }}
+    container: nvidia/cuda:12.8.1-devel-ubuntu24.04
+    steps:
+      - name: Install build tooling
+        run: |
+          apt-get update
+          apt-get install -y --no-install-recommends git curl ca-certificates build-essential gh
+
+      - name: Checkout
+        uses: actions/checkout@v5
+        with:
+          ref: ${{ inputs.ref }}
+
+      - name: Install uv
+        run: |
+          curl -LsSf https://astral.sh/uv/install.sh | env INSTALLER_NO_MODIFY_PATH=1 UV_INSTALL_DIR=/usr/local/bin sh
+          uv --version
+
+      - name: Create build environment
+        env:
+          UV_TORCH_BACKEND: ${{ env.CUDA_TAG }}
+        run: |
+          uv venv --python 3.12 /tmp/build-env
+          VIRTUAL_ENV=/tmp/build-env uv pip install "torch>=2.9.0" setuptools wheel ninja
+
+      # torch C++ extensions are bound to the torch and CUDA they were compiled against, so
+      # the wheel carries both in its local version.
+      - name: Stamp ABI into the version
+        run: |
+          TORCH_VERSION=$(/tmp/build-env/bin/python -c 'import torch; print(torch.__version__.split("+")[0])')
+          LOCAL="${CUDA_TAG}torch${TORCH_VERSION}"
+          sed -i -E "s/^version = \"([^\"]+)\"$/version = \"\1+${LOCAL}\"/" pyproject.toml
+          grep '^version' pyproject.toml
+
+      - name: Build wheel
+        env:
+          VIRTUAL_ENV: /tmp/build-env
+          CUDA_HOME: /usr/local/cuda
+          PRIME_KERNELS_REQUIRE: "1"
+          MAX_JOBS: "8"
+        run: uv build --wheel --no-build-isolation --out-dir dist
+
+      - name: Inspect wheel
+        run: |
+          ls -lh dist/
+          /tmp/build-env/bin/python - <<'PY'
+          import pathlib, zipfile
+          wheel = next(pathlib.Path("dist").glob("*.whl"))
+          extensions = [n for n in zipfile.ZipFile(wheel).namelist() if n.endswith(".so")]
+          assert extensions, f"{wheel.name} contains no compiled kernels"
+          print(wheel.name, *extensions, sep="\n  ")
+          PY
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: prime-kernels-${{ matrix.arch }}
+          path: dist/*.whl
+          if-no-files-found: error
+
+      - name: Attach to release
+        if: inputs.release_tag != ''
+        env:
+          GH_TOKEN: ${{ github.token }}
+          # gh must not resolve the repo from the checkout: inside the container the
+          # workspace is owned by another uid, which git rejects as dubious ownership.
+          GH_REPO: ${{ github.repository }}
+          TAG: ${{ inputs.release_tag }}
+        run: |
+          gh release upload "$TAG" dist/*.whl --clobber
+          # Consumers' `[tool.uv.sources]` pin has to name the wheel exactly, ABI suffix and all.
+          WHEEL=$(basename dist/*.whl)
+          URL="https://github.com/${GITHUB_REPOSITORY}/releases/download/${TAG}/${WHEEL}"
+          echo "\`{ url = \"$URL\", marker = \"platform_machine == '${{ matrix.arch }}'\" },\`" >> "$GITHUB_STEP_SUMMARY"
