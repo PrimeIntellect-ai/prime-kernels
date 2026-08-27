@@ -24,6 +24,12 @@ include-dirs = ["csrc/kernels"]
 arch = ["10.0a"]
 cxx-std = 20
 
+[mxfp8_moe]
+description = "MXFP8 grouped GEMM and expert-parallel transport"
+python-only = true
+requires = ["torchao"]
+arch = ["10.0"]
+
 [indexed_attention]
 description = "Training forward and backward for token-indexed grouped-query attention"
 python-only = true

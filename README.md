@@ -13,6 +13,7 @@ CUDA kernels for Prime Intellect training stacks, shipped as one wheel, `prime-k
     │   ├── __init__.py       # Python surface: op wrappers, fake tensors
     │   ├── mxfp8.py
     │   └── csrc/             # the C++/CUDA sources compiled into prime_kernels.flash_moe._C
+    ├── mxfp8_moe/            # Python-only MXFP8 MoE runtime kernels
     ├── indexed_attention/    # Python-only TileLang indexed GQA forward + backward
     └── rmsnorm/
         ├── __init__.py
@@ -52,10 +53,9 @@ kernel, and returns the scales already in the blocked layout a tensor core GEMM 
 its sources are committed for now — its table in `kernels.toml` is commented out, so it is
 neither built nor shipped in the wheel, and the registry does not list it.
 
-`flash_moe` is used by prime-rl's MoE layers under `model.moe_fused_kernel=true`, which
-resolves the kernel during model setup so an unusable install fails before training starts.
-It picks `fused_moe_mxfp8` when the run also quantizes the experts to MXFP8 and
-`fused_moe_bf16` otherwise.
+`flash_moe` is currently dormant in prime-rl. `mxfp8_moe` provides differentiable MXFP8
+grouped GEMM and MXFP8 expert-parallel transport. It is registered as Python-only because
+it orchestrates PyTorch and torchao kernels rather than compiling a `_C` extension here.
 
 `indexed_attention` provides differentiable grouped-query attention over an explicit token
 selection for each query. Its TileLang kernels compute selection scores and radix selection
