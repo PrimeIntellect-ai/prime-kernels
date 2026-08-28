@@ -8,7 +8,7 @@ name: Build and Release Kernels
 # itself (see scripts/install_ep_kernels.sh, scripts/install_deep_gemm.sh,
 # scripts/build_torchao.sh for the pinned revs).
 #
-# Matrix: {kernel} x {arch: x86_64, aarch64}, all built against CUDA 12.9 (matches the
+# Matrix: {kernel} x {arch: x86_64, aarch64}, all built against CUDA 13.0 (matches the
 # driver on our Blackwell fleet; see CUDA_TAG below). TORCH_CUDA_ARCH_LIST is set
 # explicitly per kernel so every wheel covers Hopper + datacenter Blackwell + Blackwell
 # Ultra + workstation/consumer Blackwell (sm_120, e.g. RTX PRO 6000) — the install
@@ -67,12 +67,12 @@ concurrency:
 
 env:
   # Keep in sync with the CUDA toolkit the container images below use.
-  CUDA_TAG: cu129
+  CUDA_TAG: cu130
   # `smoke-test`'s container is a stand-in for the real deployment target (Ubuntu 24.04
   # — see Dockerfile.cuda in prime-rl), deliberately different from `build`'s (see the
   # portability comment up top and the per-arch images in the `build` matrix below).
-  CONTAINER_IMAGE: nvidia/cuda:12.9.1-devel-ubuntu24.04
-  TORCH_VERSION: 2.13.0+cu129
+  CONTAINER_IMAGE: nvidia/cuda:13.0.3-devel-ubuntu24.04
+  TORCH_VERSION: 2.13.0+cu130
 
 jobs:
   build:
@@ -89,10 +89,10 @@ jobs:
           # for linux/arm64/v8"); `manylinuxaarch64-builder` is its aarch64 counterpart.
           - arch: x86_64
             runner: image-builder
-            build_image: pytorch/manylinux2_28-builder:cuda12.9
+            build_image: pytorch/manylinux2_28-builder:cuda13.0
           - arch: aarch64
             runner: image-builder-arm-2204
-            build_image: pytorch/manylinuxaarch64-builder:cuda12.9
+            build_image: pytorch/manylinuxaarch64-builder:cuda13.0
     runs-on: ${{ matrix.runner }}
     # `matrix` (unlike `env`) is available in `container:`, so this can vary by arch.
     container: ${{ matrix.build_image }}
@@ -210,7 +210,7 @@ jobs:
     # `env` isn't available in `container:` (GitHub Actions only exposes it inside
     # steps), so this has to be a literal — keep it in sync with CONTAINER_IMAGE above.
     container:
-      image: nvidia/cuda:12.9.1-devel-ubuntu24.04
+      image: nvidia/cuda:13.0.3-devel-ubuntu24.04
       options: --gpus all
     steps:
       - name: Install runtime tooling
