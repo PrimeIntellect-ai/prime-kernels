@@ -140,6 +140,28 @@ mkdir -p "$WHEEL_DIR"
 python setup.py bdist_wheel --dist-dir "$WHEEL_DIR"
 
 WHEEL=$(ls "$WHEEL_DIR"/deep_ep*.whl | head -1)
+
+# deep_ep_cpp links -l:libnvshmem_host.so.3 but DeepEP's setup.py bakes in an absolute
+# RPATH pointing at $NVSHMEM_DIR — a build-only directory (nowhere on a consumer's
+# machine). It currently loads anyway only because torch's own preload list forces
+# libnvshmem_host.so.* into the process globally before deep_ep is ever imported (see
+# torch/__init__.py) — true today, but an implementation detail of torch we don't own.
+# Repoint it at the nvidia-nvshmem-cu13 pip package instead, which ships at
+# site-packages/nvidia/nvshmem/lib — a sibling of deep_ep_cpp*.so at the site-packages
+# root — so this doesn't depend on that torch behavior persisting.
+echo ""
+echo "--- Patching deep_ep_cpp's RPATH to the nvshmem pip package ---"
+PATCH_DIR=$(mktemp -d)
+python -m wheel unpack "$WHEEL" --dest "$PATCH_DIR"
+UNPACKED=$(find "$PATCH_DIR" -maxdepth 1 -mindepth 1 -type d)
+SO_FILE=$(find "$UNPACKED" -maxdepth 1 -name "deep_ep_cpp*.so")
+patchelf --set-rpath '$ORIGIN/nvidia/nvshmem/lib' "$SO_FILE"
+echo "New RPATH: $(patchelf --print-rpath "$SO_FILE")"
+rm -f "$WHEEL"
+python -m wheel pack "$UNPACKED" --dest-dir "$WHEEL_DIR"
+rm -rf "$PATCH_DIR"
+WHEEL=$(ls "$WHEEL_DIR"/deep_ep*.whl | head -1)
+
 echo ""
 echo "--- DeepEP wheel built at: $WHEEL ---"
 echo "================================================================"
