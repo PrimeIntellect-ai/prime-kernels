@@ -187,13 +187,18 @@ jobs:
       # flash-attn's own version string is static ("2.8.3", no embedded rev), so unlike
       # deep-ep/deep-gemm/torchao it needs an explicit local-version tag to disambiguate
       # a future CUDA/torch bump the same way prime-kernels' own "Stamp ABI" step does.
+      #
+      # Deliberately no MAX_JOBS here, unlike every other kernel: flash-attn's own
+      # NinjaBuildExtension self-throttles job count from actual free memory (each
+      # nvcc job peaks at ~8-9GB, worse with 4 archs baked into one gencode list) *only*
+      # when MAX_JOBS is unset — setting it, as we do everywhere else, disables that
+      # safety check and OOM-kills the runner (confirmed: exit 137 in under 2 minutes).
       - name: Build flash-attn wheel
         if: matrix.kernel == 'flash-attn'
         env:
           VIRTUAL_ENV: /tmp/build-env
           CUDA_HOME: /usr/local/cuda
           FLASH_ATTN_CUDA_ARCHS: "80;90;100;120"
-          MAX_JOBS: "8"
         run: |
           export PATH="/tmp/build-env/bin:$PATH"
           TORCH_VER_ONLY="${{ env.TORCH_VERSION }}"
