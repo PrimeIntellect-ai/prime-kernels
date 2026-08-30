@@ -21,6 +21,7 @@ __all__ = [
 ]
 
 _SPECS: dict[str, KernelSpec] = _load_manifest(Path(__file__).parent)
+_LOADED_MODULES: dict[str, ModuleType] = {}
 
 KERNELS: tuple[str, ...] = tuple(_SPECS)
 
@@ -61,10 +62,16 @@ def is_available(name: str, device: int | None = None) -> bool:
 
 
 def load(name: str, device: int | None = None) -> ModuleType:
+    try:
+        return _LOADED_MODULES[name]
+    except KeyError:
+        pass
     reason = unavailable_reason(name, device)
     if reason is not None:
         raise RuntimeError(reason)
-    return importlib.import_module(spec(name).module)
+    module = importlib.import_module(spec(name).module)
+    _LOADED_MODULES[name] = module
+    return module
 
 
 def status(device: int | None = None) -> dict[str, str]:

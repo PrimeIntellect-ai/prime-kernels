@@ -13,6 +13,7 @@ CUDA kernels for Prime Intellect training stacks, shipped as one wheel, `prime-k
     │   ├── __init__.py       # Python surface: op wrappers, fake tensors
     │   ├── mxfp8.py
     │   └── csrc/             # the C++/CUDA sources compiled into prime_kernels.flash_moe._C
+    ├── indexed_attention/    # Python-only TileLang indexed GQA forward + backward
     ├── mxfp8_moe/            # Python-only MXFP8 MoE runtime kernels
     └── rmsnorm/
         ├── __init__.py
@@ -53,6 +54,9 @@ neither built nor shipped in the wheel, and the registry does not list it.
 `flash_moe` is currently dormant in prime-rl. `mxfp8_moe` provides differentiable MXFP8
 grouped GEMM and MXFP8 expert-parallel transport. It is registered as Python-only because
 it orchestrates PyTorch and torchao kernels rather than compiling a `_C` extension here.
+`indexed_attention` provides differentiable grouped-query attention over an explicit token
+selection for each query. Its TileLang kernels accept different query and KV lengths so the
+caller can gather KV for context parallelism without gathering queries.
 
 ## Installing
 
@@ -97,7 +101,9 @@ cxx-std = 20
 
 For a Python-only kernel, set `python-only = true`, omit `ops` and `sources`, and expose
 the differentiable Python surface from `__init__.py`. Optional import requirements belong
-in the manifest's `requires` list so `is_available()` fails during setup.
+in the manifest's `requires` list so `is_available()` fails during setup. Python-only ops
+may use `torch.library.custom_op`; register fake and autograd implementations so they remain
+visible to `torch.compile` and training.
 
 Whatever the kernel requires of its inputs — block sizes, alignments, layouts — belongs
 here, not in the caller: `TORCH_CHECK` it in the binding, and export the constants
