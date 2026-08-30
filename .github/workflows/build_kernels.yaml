@@ -2,11 +2,20 @@ name: Build and Release Kernels
 
 # Builds every wheel prime-rl (and other consumers) pin via `[tool.uv.sources]`:
 # prime-kernels (this repo's own kernels.toml-declared extensions), deep-ep and
-# deep-gemm (from their pinned deepseek-ai revs), and our torchao (from the pytorch/ao
-# rev the MXFP8 training path requires). This repo is the single build+release site for
-# all four — prime-rl only consumes the resulting release, it does not build anything
-# itself (see scripts/install_ep_kernels.sh, scripts/install_deep_gemm.sh,
-# scripts/build_torchao.sh for the pinned revs).
+# deep-gemm (from their pinned deepseek-ai revs), our torchao (from the pytorch/ao
+# rev the MXFP8 training path requires), and flash-attn (pinned to the upstream v2.8.3
+# tag). This repo is the single build+release site for all five — prime-rl only
+# consumes the resulting release, it does not build anything itself (see
+# scripts/install_ep_kernels.sh, scripts/install_deep_gemm.sh, scripts/build_torchao.sh,
+# scripts/install_flash_attn.sh for the pinned revs).
+#
+# flash-attn is built here instead of consumed from mjun0812/flash-attention-prebuild-wheels
+# (what prime-rl used before) because that project's newest build for this flash-attn +
+# torch2.13 combo predating a cu129 release is cu126 — CUDA 12.6 predates 12.8, the floor
+# flash-attn's own setup.py requires before it will even emit sm_100/sm_120 gencodes — so
+# that prebuilt wheel only ever contained sm_80/sm_90 cubins and no PTX, hard-failing
+# flash_attention_2 on every Blackwell GPU (confirmed via `cuobjdump --list-elf` on the
+# actual wheel). Building it ourselves against this repo's CUDA 12.9 container fixes that.
 #
 # Matrix: {kernel} x {arch: x86_64, aarch64}, all built against CUDA 13.0 (matches the
 # driver on our Blackwell fleet; see CUDA_TAG below). TORCH_CUDA_ARCH_LIST is set
@@ -42,6 +51,7 @@ on:
       - "scripts/install_ep_kernels.sh"
       - "scripts/install_deep_gemm.sh"
       - "scripts/build_torchao.sh"
+      - "scripts/install_flash_attn.sh"
       - "scripts/smoke_test.py"
       - "pyproject.toml"
       - ".github/workflows/build_kernels.yaml"
@@ -51,6 +61,7 @@ on:
       - "scripts/install_ep_kernels.sh"
       - "scripts/install_deep_gemm.sh"
       - "scripts/build_torchao.sh"
+      - "scripts/install_flash_attn.sh"
       - "scripts/smoke_test.py"
       - "pyproject.toml"
       - ".github/workflows/build_kernels.yaml"
@@ -80,7 +91,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        kernel: [prime-kernels, deep-ep, deep-gemm, torchao]
+        kernel: [prime-kernels, deep-ep, deep-gemm, torchao, flash-attn]
         arch: [x86_64, aarch64]
         include:
           # PyTorch publishes separate manylinux builder images per arch, not a
@@ -173,6 +184,27 @@ jobs:
           export PATH="/tmp/build-env/bin:$PATH"
           bash scripts/build_torchao.sh --wheel-dir dist
 
+      # flash-attn's own version string is static ("2.8.3", no embedded rev), so unlike
+      # deep-ep/deep-gemm/torchao it needs an explicit local-version tag to disambiguate
+      # a future CUDA/torch bump the same way prime-kernels' own "Stamp ABI" step does.
+      #
+      # Deliberately no MAX_JOBS here, unlike every other kernel: flash-attn's own
+      # NinjaBuildExtension self-throttles job count from actual free memory (each
+      # nvcc job peaks at ~8-9GB, worse with 4 archs baked into one gencode list) *only*
+      # when MAX_JOBS is unset — setting it, as we do everywhere else, disables that
+      # safety check and OOM-kills the runner (confirmed: exit 137 in under 2 minutes).
+      - name: Build flash-attn wheel
+        if: matrix.kernel == 'flash-attn'
+        env:
+          VIRTUAL_ENV: /tmp/build-env
+          CUDA_HOME: /usr/local/cuda
+          FLASH_ATTN_CUDA_ARCHS: "80;90;100;120"
+        run: |
+          export PATH="/tmp/build-env/bin:$PATH"
+          TORCH_VER_ONLY="${{ env.TORCH_VERSION }}"
+          export FLASH_ATTN_LOCAL_VERSION="${{ env.CUDA_TAG }}torch${TORCH_VER_ONLY%%+*}"
+          bash scripts/install_flash_attn.sh --wheel-dir dist
+
       - name: Inspect wheel
         run: |
           ls -lh dist/
@@ -205,7 +237,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        kernel: [prime-kernels, deep-ep, deep-gemm, torchao]
+        kernel: [prime-kernels, deep-ep, deep-gemm, torchao, flash-attn]
     runs-on: vm
     # `env` isn't available in `container:` (GitHub Actions only exposes it inside
     # steps), so this has to be a literal — keep it in sync with CONTAINER_IMAGE above.
