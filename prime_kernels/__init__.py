@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import importlib
+import importlib.util
 from importlib.machinery import EXTENSION_SUFFIXES
 from pathlib import Path
 from types import ModuleType
@@ -31,7 +32,10 @@ def spec(name: str) -> KernelSpec:
 
 
 def is_built(name: str) -> bool:
-    directory = spec(name).path
+    kernel = spec(name)
+    directory = kernel.path
+    if kernel.python_only:
+        return (directory / "__init__.py").is_file()
     return any((directory / f"_C{suffix}").exists() for suffix in EXTENSION_SUFFIXES)
 
 
@@ -41,6 +45,9 @@ def unavailable_reason(name: str, device: int | None = None) -> str | None:
     kernel = spec(name)
     if not is_built(name):
         return f"{name} was not compiled into this install of prime-kernels"
+    missing = [requirement for requirement in kernel.requires if importlib.util.find_spec(requirement) is None]
+    if missing:
+        return f"{name} requires {', '.join(missing)}, which is not installed"
     if not torch.cuda.is_available():
         return f"{name} requires a CUDA device ({kernel.sm_list}), none is available"
     capability = torch.cuda.get_device_capability(device)
