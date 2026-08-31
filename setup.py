@@ -98,10 +98,8 @@ setuptools.setup(
     # Listed explicitly: the kernel folders carry C++/CUDA sources next to their Python, and
     # only the Python surface plus the compiled extension belongs in the wheel.
     packages=["prime_kernels", *(f"prime_kernels.{name}" for name in kernels)],
-    include_package_data=False,
     package_data={
         "prime_kernels": ["kernels.toml"],
-        "prime_kernels.indexed_attention": ["LICENSE.vllm"],
         "prime_kernels.mxfp8_moe": ["LICENSE.torchao"],
     },
     ext_modules=extensions,
