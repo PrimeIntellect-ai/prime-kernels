@@ -55,8 +55,9 @@ neither built nor shipped in the wheel, and the registry does not list it.
 grouped GEMM and MXFP8 expert-parallel transport. It is registered as Python-only because
 it orchestrates PyTorch and torchao kernels rather than compiling a `_C` extension here.
 `indexed_attention` provides differentiable grouped-query attention over an explicit token
-selection for each query. Its TileLang kernels accept different query and KV lengths so the
-caller can gather KV for context parallelism without gathering queries.
+selection for each query. Its TileLang kernels compute selection scores and radix selection
+as well as attention, and accept different query and KV lengths so the caller can gather KV
+for context parallelism without gathering queries.
 
 ## Installing
 

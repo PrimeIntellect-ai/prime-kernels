@@ -32,12 +32,9 @@ arch = ["10.0"]
 
 [indexed_attention]
 description = "Training forward and backward for token-indexed grouped-query attention"
-ops = "prime_indexed_attention"
-sources = ["csrc/topk.cu"]
-include-dirs = ["csrc"]
-requires = ["tilelang", "triton"]
+python-only = true
+requires = ["tilelang"]
 arch = ["8.0", "9.0", "10.0"]
-cxx-std = 20
 
 # rmsnorm is not built yet: only its sources are committed. Uncomment the table below to
 # put it back into the build (and to make the registry report on it).
