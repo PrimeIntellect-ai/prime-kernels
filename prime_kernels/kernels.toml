@@ -24,6 +24,16 @@ include-dirs = ["csrc/kernels"]
 arch = ["10.0a"]
 cxx-std = 20
 
+[comet_scatter]
+description = "Symmetric-memory tile scatter/wait/reduce for comet_moe's dispatch/combine"
+ops = "prime_comet_scatter"
+sources = [
+    "csrc/torch_interface.cpp",
+    "csrc/kernels.cu",
+]
+arch = ["10.0a"]
+cxx-std = 20
+
 [mxfp8_moe]
 description = "MXFP8 grouped GEMM and expert-parallel transport"
 python-only = true
