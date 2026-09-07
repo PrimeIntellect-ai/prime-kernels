@@ -4,7 +4,7 @@ import torch
 
 from . import _C
 
-__all__ = ["scatter_tiles", "wait_tiles", "wait_and_reduce"]
+__all__ = ["scatter_tiles", "wait_tiles", "wait_and_reduce", "fused_dispatch_ffn"]
 
 
 def scatter_tiles(
@@ -44,4 +44,47 @@ def wait_and_reduce(
         local_hidden, local_flag, routed_scores, weighted_routed_out,
         dispatch_peer_rank, dispatch_local_row_start, dispatch_own_tile_ordinal, dispatch_valid_rows,
         block_m, n_blocks,
+    )
+
+
+def fused_dispatch_ffn(
+    src: torch.Tensor,
+    hidden_peer_ptrs: torch.Tensor,
+    flag_peer_ptrs: torch.Tensor,
+    tile_peer_rank: torch.Tensor,
+    tile_local_row_start: torch.Tensor,
+    tile_peer_row_start: torch.Tensor,
+    tile_valid_rows: torch.Tensor,
+    tile_flag_index: torch.Tensor,
+    recv_hidden: torch.Tensor,
+    recv_flag: torch.Tensor,
+    recv_tile_valid: torch.Tensor,
+    recv_tile_to_local_expert: torch.Tensor,
+    gate_proj: torch.Tensor | None,
+    up_proj: torch.Tensor,
+    down_proj: torch.Tensor,
+    expert_out: torch.Tensor,
+    act_scratch: torch.Tensor,
+    gate_scratch: torch.Tensor | None,
+    block_start_clock: torch.Tensor,
+    block_end_clock: torch.Tensor,
+    block_m: int,
+    n_producer_blocks: int,
+    n_consumer_blocks: int,
+) -> None:
+    """CTA-specialized, single-kernel-launch fusion of dispatch (producer CTAs, blockIdx.x <
+    n_producer_blocks) and the gated/ungated SiLU expert FFN (consumer CTAs, the rest) -- a
+    prototype for real intra-kernel compute/communication overlap, replacing the two-CUDA-stream
+    approach (which was measured to have zero actual kernel overlap: the comm wait resolves before
+    the compute stream even starts). Producer and consumer CTAs are part of the same grid, so the
+    CUDA scheduler can run them concurrently on different SMs without any separate-kernel-launch
+    overhead. Not cutlass-competitive (plain shared-memory-tiled bf16 GEMM, fp32 accumulate, no
+    tensor cores) and only SiLU (gated or ungated) is supported -- see kernels.cu's docstring.
+    """
+    torch.ops.prime_comet_scatter.fused_dispatch_ffn(
+        src, hidden_peer_ptrs, flag_peer_ptrs, tile_peer_rank, tile_local_row_start,
+        tile_peer_row_start, tile_valid_rows, tile_flag_index,
+        recv_hidden, recv_flag, recv_tile_valid, recv_tile_to_local_expert,
+        gate_proj, up_proj, down_proj, expert_out, act_scratch, gate_scratch,
+        block_start_clock, block_end_clock, block_m, n_producer_blocks, n_consumer_blocks,
     )

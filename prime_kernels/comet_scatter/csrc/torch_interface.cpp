@@ -22,7 +22,6 @@ namespace pi {
     ) {
         at::cuda::OptionalCUDAGuard device_guard{device_of(src)};
         cudaStream_t stream = at::cuda::getCurrentCUDAStream();
-
         TORCH_CHECK(src.dim() == 2, "src must be a 2D (rows, dim) tensor");
         TORCH_CHECK(src.is_contiguous(), "src must be contiguous");
         int64_t row_bytes = src.size(1) * src.element_size();
@@ -35,7 +34,6 @@ namespace pi {
         TORCH_CHECK(tile_peer_row_start.numel() == n_tiles, "tile schedule tensors must have matching length");
         TORCH_CHECK(tile_valid_rows.numel() == n_tiles, "tile schedule tensors must have matching length");
         TORCH_CHECK(tile_flag_index.numel() == n_tiles, "tile schedule tensors must have matching length");
-
         pi::launch_scatter_tiles(
             static_cast<const uint8_t *>(src.const_data_ptr()),
             static_cast<const int64_t *>(hidden_peer_ptrs.const_data_ptr()),
@@ -55,11 +53,9 @@ namespace pi {
     static void wait_tiles_torch_stub(torch::Tensor local_flag, const torch::Tensor &tile_valid) {
         at::cuda::OptionalCUDAGuard device_guard{device_of(local_flag)};
         cudaStream_t stream = at::cuda::getCurrentCUDAStream();
-
         TORCH_CHECK(local_flag.dtype() == torch::kInt32, "local_flag must be int32");
         TORCH_CHECK(tile_valid.dtype() == torch::kInt32, "tile_valid must be int32");
         TORCH_CHECK(local_flag.numel() == tile_valid.numel(), "local_flag and tile_valid must have the same length");
-
         pi::launch_wait_tiles(
             static_cast<int32_t *>(local_flag.mutable_data_ptr()),
             static_cast<const int32_t *>(tile_valid.const_data_ptr()),
@@ -82,7 +78,6 @@ namespace pi {
     ) {
         at::cuda::OptionalCUDAGuard device_guard{device_of(local_hidden)};
         cudaStream_t stream = at::cuda::getCurrentCUDAStream();
-
         TORCH_CHECK(local_hidden.dtype() == torch::kBFloat16, "local_hidden must be bf16");
         TORCH_CHECK(weighted_routed_out.dtype() == torch::kBFloat16, "weighted_routed_out must be bf16");
         TORCH_CHECK(routed_scores.dtype() == torch::kFloat32, "routed_scores must be fp32");
@@ -92,7 +87,6 @@ namespace pi {
         int64_t dim = local_hidden.size(1);
         TORCH_CHECK(weighted_routed_out.size(1) == dim, "local_hidden and weighted_routed_out must share dim");
         int64_t n_dispatch_tiles = dispatch_peer_rank.numel();
-
         pi::launch_wait_and_reduce(
             local_hidden.const_data_ptr(),
             static_cast<int32_t *>(local_flag.mutable_data_ptr()),
@@ -106,6 +100,80 @@ namespace pi {
             static_cast<int>(block_m),
             static_cast<int>(dim),
             static_cast<int>(n_blocks),
+            stream
+        );
+    }
+
+    static void fused_dispatch_ffn_torch_stub(
+        const torch::Tensor &src,
+        const torch::Tensor &hidden_peer_ptrs,
+        const torch::Tensor &flag_peer_ptrs,
+        const torch::Tensor &tile_peer_rank,
+        const torch::Tensor &tile_local_row_start,
+        const torch::Tensor &tile_peer_row_start,
+        const torch::Tensor &tile_valid_rows,
+        const torch::Tensor &tile_flag_index,
+        const torch::Tensor &recv_hidden,
+        torch::Tensor recv_flag,
+        const torch::Tensor &recv_tile_valid,
+        const torch::Tensor &recv_tile_to_local_expert,
+        const c10::optional<torch::Tensor> &gate_proj,
+        const torch::Tensor &up_proj,
+        const torch::Tensor &down_proj,
+        torch::Tensor expert_out,
+        torch::Tensor act_scratch,
+        const c10::optional<torch::Tensor> &gate_scratch,
+        torch::Tensor block_start_clock,
+        torch::Tensor block_end_clock,
+        int64_t block_m,
+        int64_t n_producer_blocks,
+        int64_t n_consumer_blocks
+    ) {
+        at::cuda::OptionalCUDAGuard device_guard{device_of(src)};
+        cudaStream_t stream = at::cuda::getCurrentCUDAStream();
+
+        TORCH_CHECK(recv_hidden.dtype() == torch::kBFloat16, "recv_hidden must be bf16");
+        TORCH_CHECK(up_proj.dtype() == torch::kBFloat16, "up_proj must be bf16");
+        TORCH_CHECK(down_proj.dtype() == torch::kBFloat16, "down_proj must be bf16");
+        TORCH_CHECK(expert_out.is_contiguous(), "expert_out must be contiguous");
+        bool gated = gate_proj.has_value();
+        TORCH_CHECK(gated == gate_scratch.has_value(), "gate_proj and gate_scratch must both be set or both be omitted");
+
+        int hidden_dim = static_cast<int>(recv_hidden.size(1));
+        int intermediate_dim = static_cast<int>(up_proj.size(1));
+        int64_t row_bytes = src.size(1) * src.element_size();
+        int64_t n_dispatch_tiles = tile_peer_rank.numel();
+        int64_t n_recv_tiles = recv_tile_valid.numel();
+
+        pi::launch_fused_dispatch_ffn(
+            static_cast<const uint8_t *>(src.const_data_ptr()),
+            static_cast<const int64_t *>(hidden_peer_ptrs.const_data_ptr()),
+            static_cast<const int64_t *>(flag_peer_ptrs.const_data_ptr()),
+            static_cast<const int32_t *>(tile_peer_rank.const_data_ptr()),
+            static_cast<const int32_t *>(tile_local_row_start.const_data_ptr()),
+            static_cast<const int32_t *>(tile_peer_row_start.const_data_ptr()),
+            static_cast<const int32_t *>(tile_valid_rows.const_data_ptr()),
+            static_cast<const int32_t *>(tile_flag_index.const_data_ptr()),
+            n_dispatch_tiles,
+            row_bytes,
+            recv_hidden.const_data_ptr(),
+            static_cast<int32_t *>(recv_flag.mutable_data_ptr()),
+            static_cast<const int32_t *>(recv_tile_valid.const_data_ptr()),
+            static_cast<const int32_t *>(recv_tile_to_local_expert.const_data_ptr()),
+            gated ? gate_proj->const_data_ptr() : nullptr,
+            up_proj.const_data_ptr(),
+            down_proj.const_data_ptr(),
+            expert_out.mutable_data_ptr(),
+            act_scratch.mutable_data_ptr(),
+            gated ? gate_scratch->mutable_data_ptr() : nullptr,
+            n_recv_tiles,
+            hidden_dim,
+            intermediate_dim,
+            static_cast<int>(block_m),
+            static_cast<int>(n_producer_blocks),
+            static_cast<int>(n_consumer_blocks),
+            static_cast<long long *>(block_start_clock.mutable_data_ptr()),
+            static_cast<long long *>(block_end_clock.mutable_data_ptr()),
             stream
         );
     }
@@ -143,6 +211,34 @@ TORCH_LIBRARY_FRAGMENT(prime_comet_scatter, m) {
         ") -> ()"
     );
     m.impl("wait_and_reduce", torch::kCUDA, &pi::wait_and_reduce_torch_stub);
+
+    m.def("fused_dispatch_ffn("
+        "Tensor src, "
+        "Tensor hidden_peer_ptrs, "
+        "Tensor flag_peer_ptrs, "
+        "Tensor tile_peer_rank, "
+        "Tensor tile_local_row_start, "
+        "Tensor tile_peer_row_start, "
+        "Tensor tile_valid_rows, "
+        "Tensor tile_flag_index, "
+        "Tensor recv_hidden, "
+        "Tensor(a!) recv_flag, "
+        "Tensor recv_tile_valid, "
+        "Tensor recv_tile_to_local_expert, "
+        "Tensor? gate_proj, "
+        "Tensor up_proj, "
+        "Tensor down_proj, "
+        "Tensor(b!) expert_out, "
+        "Tensor(c!) act_scratch, "
+        "Tensor(d!)? gate_scratch, "
+        "Tensor(e!) block_start_clock, "
+        "Tensor(f!) block_end_clock, "
+        "int block_m, "
+        "int n_producer_blocks, "
+        "int n_consumer_blocks"
+        ") -> ()"
+    );
+    m.impl("fused_dispatch_ffn", torch::kCUDA, &pi::fused_dispatch_ffn_torch_stub);
 }
 
 PYBIND11_MODULE(_C, m) {}
