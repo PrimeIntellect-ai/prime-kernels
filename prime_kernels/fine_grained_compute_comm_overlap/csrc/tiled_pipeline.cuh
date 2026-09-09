@@ -84,7 +84,7 @@ namespace pi {
 
     template <typename Transport, typename Compute, typename Scheduler>
         requires tile_transport<Transport> && tile_compute<Compute> && tile_scheduler<Scheduler>
-    __global__ __launch_bounds__(1024) void tile_pipeline_kernel_hull(
+    __global__ void tile_pipeline_kernel_hull(
         Transport transport,
         Compute compute,
         Scheduler sched,
