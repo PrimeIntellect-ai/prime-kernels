@@ -34,7 +34,7 @@ arch = ["10.0"]
 [nvfp4_moe]
 description = "Per-token NVFP4 grouped GEMM with BF16 backward"
 build-requires = ["nvidia-cutlass==4.2.0.0"]
-ops = "prime_nvfp4"
+ops = "prime_rl"
 sources = [
     "csrc/torch_interface.cpp",
     "csrc/quantize/bindings.cpp",
