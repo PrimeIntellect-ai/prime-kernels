@@ -85,9 +85,9 @@ namespace pi {
     template <typename Transport, typename Compute, typename Scheduler>
         requires tile_transport<Transport> && tile_compute<Compute> && tile_scheduler<Scheduler>
     __global__ void tile_pipeline_kernel_hull(
-        Transport transport,
-        Compute compute,
-        Scheduler sched,
+        const __grid_constant__ Transport transport,
+        const __grid_constant__ Compute compute,
+        const __grid_constant__ Scheduler sched,
         int num_prod_blocks
     ) {
         extern __shared__ __align__(1024) uint8_t tilepipe_dynamic_smem[];
