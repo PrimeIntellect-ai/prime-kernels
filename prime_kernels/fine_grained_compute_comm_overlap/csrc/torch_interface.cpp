@@ -277,7 +277,7 @@ namespace pi {
     }
 }
 
-TORCH_LIBRARY_FRAGMENT(prime_comet_scatter, m) {
+TORCH_LIBRARY_FRAGMENT(prime_fine_grained_compute_comm_overlap, m) {
     m.def("scatter_tiles("
         "Tensor src, "
         "Tensor hidden_peer_ptrs, "

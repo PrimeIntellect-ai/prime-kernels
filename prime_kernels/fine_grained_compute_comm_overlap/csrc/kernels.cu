@@ -696,13 +696,13 @@ void launch_fused_dispatch_ffn(
     auto make_tmap = [](const char *name, const void *ptr, int64_t rows, int width) {
         return init_tmap_kmajor_3d(name, ptr, rows, width, TCGEN05_BLOCK_M, 8);
     };
-    CUtensorMap hidden_tmap = make_tmap("comet_scatter.hidden", recv_hidden_bf16, dispatch_capacity, hidden_dim);
-    CUtensorMap up_tmap = make_tmap("comet_scatter.up_proj", up_proj_bf16, num_local_experts*intermediate_dim, hidden_dim);
+    CUtensorMap hidden_tmap = make_tmap("fine_grained_compute_comm_overlap.hidden", recv_hidden_bf16, dispatch_capacity, hidden_dim);
+    CUtensorMap up_tmap = make_tmap("fine_grained_compute_comm_overlap.up_proj", up_proj_bf16, num_local_experts*intermediate_dim, hidden_dim);
     CUtensorMap gate_tmap = gate_proj_bf16 != nullptr
-        ? make_tmap("comet_scatter.gate_proj", gate_proj_bf16, num_local_experts*intermediate_dim, hidden_dim)
+        ? make_tmap("fine_grained_compute_comm_overlap.gate_proj", gate_proj_bf16, num_local_experts*intermediate_dim, hidden_dim)
         : CUtensorMap{};
-    CUtensorMap act_tmap = make_tmap("comet_scatter.act_scratch", act_scratch_bf16, (int64_t)n_consumer_blocks*block_m, intermediate_dim);
-    CUtensorMap down_tmap = make_tmap("comet_scatter.down_proj", down_proj_bf16, num_local_experts*hidden_dim, intermediate_dim);
+    CUtensorMap act_tmap = make_tmap("fine_grained_compute_comm_overlap.act_scratch", act_scratch_bf16, (int64_t)n_consumer_blocks*block_m, intermediate_dim);
+    CUtensorMap down_tmap = make_tmap("fine_grained_compute_comm_overlap.down_proj", down_proj_bf16, num_local_experts*hidden_dim, intermediate_dim);
 
     constexpr int smem_size = (TCGEN05_BLOCK_M + TCGEN05_BLOCK_N)*TCGEN05_BLOCK_K*sizeof(__nv_bfloat16);
     cudaFuncSetAttribute(fused_dispatch_ffn_kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, smem_size);

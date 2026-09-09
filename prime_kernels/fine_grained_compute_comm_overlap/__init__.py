@@ -18,14 +18,14 @@ def scatter_tiles(
     tile_flag_index: torch.Tensor,
     n_blocks: int = 132,
 ) -> None:
-    torch.ops.prime_comet_scatter.scatter_tiles(
+    torch.ops.prime_fine_grained_compute_comm_overlap.scatter_tiles(
         src, hidden_peer_ptrs, flag_peer_ptrs, tile_peer_rank, tile_local_row_start,
         tile_peer_row_start, tile_valid_rows, tile_flag_index, n_blocks,
     )
 
 
 def wait_tiles(local_flag: torch.Tensor, tile_valid: torch.Tensor) -> None:
-    torch.ops.prime_comet_scatter.wait_tiles(local_flag, tile_valid)
+    torch.ops.prime_fine_grained_compute_comm_overlap.wait_tiles(local_flag, tile_valid)
 
 
 def wait_and_reduce(
@@ -40,7 +40,7 @@ def wait_and_reduce(
     block_m: int,
     n_blocks: int = 132,
 ) -> None:
-    torch.ops.prime_comet_scatter.wait_and_reduce(
+    torch.ops.prime_fine_grained_compute_comm_overlap.wait_and_reduce(
         local_hidden, local_flag, routed_scores, weighted_routed_out,
         dispatch_peer_rank, dispatch_local_row_start, dispatch_own_tile_ordinal, dispatch_valid_rows,
         block_m, n_blocks,
@@ -81,7 +81,7 @@ def fused_dispatch_ffn(
     overhead. Not cutlass-competitive (plain shared-memory-tiled bf16 GEMM, fp32 accumulate, no
     tensor cores) and only SiLU (gated or ungated) is supported -- see kernels.cu's docstring.
     """
-    torch.ops.prime_comet_scatter.fused_dispatch_ffn(
+    torch.ops.prime_fine_grained_compute_comm_overlap.fused_dispatch_ffn(
         src, hidden_peer_ptrs, flag_peer_ptrs, tile_peer_rank, tile_local_row_start,
         tile_peer_row_start, tile_valid_rows, tile_flag_index,
         recv_hidden, recv_flag, recv_tile_valid, recv_tile_to_local_expert,
@@ -121,7 +121,7 @@ def fused_grad_combine_ffn(
 ) -> None:
     """Backward mirror of `fused_dispatch_ffn`: producer CTAs scatter a gradient (`src`, e.g.
     `grad_combine_hidden`) into a peer's symmetric-memory buffer using the *forward* dispatch
-    schedule (role-swapped, same trick `CometMoELayerFunction.backward` already uses for the
+    schedule (role-swapped, same trick `OverlappedMoELayerFunction.backward` already uses for the
     unfused path); consumer CTAs wait per-tile then compute both the FFN's *input* gradient
     (`grad_dispatch_hidden_out`) and its *weight* gradients (`grad_up_proj`/`grad_down_proj`/
     `grad_gate_proj`) via real WMMA GEMMs, recomputing `up`/`gate` from the saved `hidden_shadow`
@@ -132,7 +132,7 @@ def fused_grad_combine_ffn(
     afterwards). Only gated/ungated SiLU is supported. See `kernels.cu`'s
     `fused_grad_combine_ffn_kernel` docstring for the math.
     """
-    torch.ops.prime_comet_scatter.fused_grad_combine_ffn(
+    torch.ops.prime_fine_grained_compute_comm_overlap.fused_grad_combine_ffn(
         src, hidden_peer_ptrs, flag_peer_ptrs, tile_peer_rank, tile_local_row_start,
         tile_peer_row_start, tile_valid_rows, tile_flag_index,
         grad_expert_out_recv, recv_flag, recv_tile_valid, recv_tile_to_local_expert,

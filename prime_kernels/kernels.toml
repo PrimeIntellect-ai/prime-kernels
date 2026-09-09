@@ -24,9 +24,9 @@ include-dirs = ["csrc/kernels"]
 arch = ["10.0a"]
 cxx-std = 20
 
-[comet_scatter]
-description = "Symmetric-memory tile scatter/wait/reduce for comet_moe's dispatch/combine"
-ops = "prime_comet_scatter"
+[fine_grained_compute_comm_overlap]
+description = "Symmetric-memory tile scatter/wait/reduce for overlapped_moe's dispatch/combine"
+ops = "prime_fine_grained_compute_comm_overlap"
 sources = [
     "csrc/torch_interface.cpp",
     "csrc/kernels.cu",
