@@ -22,16 +22,16 @@ at::Tensor grouped_mm(
       weight_expert_scales);
 }
 
-TORCH_LIBRARY_FRAGMENT(prime_nvfp4, m) {
+TORCH_LIBRARY_FRAGMENT(prime_rl, m) {
   m.def(
-      "grouped_mm(Tensor activations, Tensor weight, "
+      "grouped_nvfp4_gemm(Tensor activations, Tensor weight, "
       "Tensor activation_block_scales, Tensor weight_block_scales, "
       "Tensor offsets, Tensor activation_token_scales, "
       "Tensor weight_expert_scales) -> Tensor");
 }
 
-TORCH_LIBRARY_IMPL(prime_nvfp4, CUDA, m) {
-  m.impl("grouped_mm", grouped_mm);
+TORCH_LIBRARY_IMPL(prime_rl, CUDA, m) {
+  m.impl("grouped_nvfp4_gemm", grouped_mm);
 }
 
 } // namespace prime_kernels::nvfp4

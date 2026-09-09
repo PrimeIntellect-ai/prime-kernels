@@ -89,17 +89,17 @@ def _grouped_mm_fake(
     )
 
 
-torch.library.register_fake("prime_nvfp4::quantize_activations", _quantize_activations_fake)
-_quantize_activations = torch.ops.prime_nvfp4.quantize_activations.default
+torch.library.register_fake("prime_rl::quantize_nvfp4_activations", _quantize_activations_fake)
+_quantize_activations = torch.ops.prime_rl.quantize_nvfp4_activations.default
 
-torch.library.register_fake("prime_nvfp4::quantize_weights", _quantize_weights_fake)
-_quantize_weights = torch.ops.prime_nvfp4.quantize_weights.default
+torch.library.register_fake("prime_rl::quantize_nvfp4_weights", _quantize_weights_fake)
+_quantize_weights = torch.ops.prime_rl.quantize_nvfp4_weights.default
 
-torch.library.register_fake("prime_nvfp4::dequantize_activations", _dequantize_activations_fake)
-_dequantize_activations = torch.ops.prime_nvfp4.dequantize_activations.default
+torch.library.register_fake("prime_rl::dequantize_nvfp4_activations", _dequantize_activations_fake)
+_dequantize_activations = torch.ops.prime_rl.dequantize_nvfp4_activations.default
 
-torch.library.register_fake("prime_nvfp4::dequantize_weights", _dequantize_weights_fake)
-_dequantize_weights = torch.ops.prime_nvfp4.dequantize_weights.default
+torch.library.register_fake("prime_rl::dequantize_nvfp4_weights", _dequantize_weights_fake)
+_dequantize_weights = torch.ops.prime_rl.dequantize_nvfp4_weights.default
 
-torch.library.register_fake("prime_nvfp4::grouped_mm", _grouped_mm_fake)
-_grouped_mm = torch.ops.prime_nvfp4.grouped_mm.default
+torch.library.register_fake("prime_rl::grouped_nvfp4_gemm", _grouped_mm_fake)
+_grouped_mm = torch.ops.prime_rl.grouped_nvfp4_gemm.default
