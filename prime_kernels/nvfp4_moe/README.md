@@ -13,8 +13,7 @@ and intermediate dimensions must be positive multiples of 32.
 The default backward reconstructs the packed forward operands and computes
 BF16 dgrad and wgrad. `backward="bf16"` uses the original BF16 operands.
 Master parameters and optimizer precision are controlled by the trainer.
-There is no adaptive 4/6 scaling. The Python autograd boundary deliberately
-breaks graph capture; use `fullgraph=False`.
+There is no adaptive 4/6 scaling. Use `fullgraph=False` with the trainer.
 
 Build with a CUDA development toolkit matching PyTorch's CUDA major.
 Kernel-specific dependencies are declared in `kernels.toml` under
