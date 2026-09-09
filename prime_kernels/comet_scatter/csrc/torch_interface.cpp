@@ -138,12 +138,19 @@ namespace pi {
         TORCH_CHECK(expert_out.is_contiguous(), "expert_out must be contiguous");
         bool gated = gate_proj.has_value();
         TORCH_CHECK(gated == gate_scratch.has_value(), "gate_proj and gate_scratch must both be set or both be omitted");
+        TORCH_CHECK(
+            block_m == 128,
+            "fused_dispatch_ffn's tcgen05 GEMM requires block_m == 128 (got ", block_m,
+            ") -- its tensor maps and MMA tiling are built for exactly this row-tile size"
+        );
 
         int hidden_dim = static_cast<int>(recv_hidden.size(1));
         int intermediate_dim = static_cast<int>(up_proj.size(1));
         int64_t row_bytes = src.size(1) * src.element_size();
         int64_t n_dispatch_tiles = tile_peer_rank.numel();
         int64_t n_recv_tiles = recv_tile_valid.numel();
+        int64_t dispatch_capacity = recv_hidden.size(0);
+        int64_t num_local_experts = up_proj.size(0);
 
         pi::launch_fused_dispatch_ffn(
             static_cast<const uint8_t *>(src.const_data_ptr()),
@@ -174,6 +181,8 @@ namespace pi {
             static_cast<int>(n_consumer_blocks),
             static_cast<long long *>(block_start_clock.mutable_data_ptr()),
             static_cast<long long *>(block_end_clock.mutable_data_ptr()),
+            dispatch_capacity,
+            num_local_experts,
             stream
         );
     }

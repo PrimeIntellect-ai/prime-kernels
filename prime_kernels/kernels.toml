@@ -31,6 +31,7 @@ sources = [
     "csrc/torch_interface.cpp",
     "csrc/kernels.cu",
 ]
+include-dirs = ["../flash_moe/csrc/kernels"]
 arch = ["10.0a"]
 cxx-std = 20
 

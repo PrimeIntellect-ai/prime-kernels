@@ -1,7 +1,9 @@
 #include "kernels.cuh"
 
+#include <cstdio>
 #include <cuda_bf16.h>
 #include <mma.h>
+#include "tcgen05_prelude.cuh"
 
 namespace pi {
     namespace {
@@ -137,7 +139,90 @@ namespace pi {
         }
     }
 
-    __global__ void fused_dispatch_ffn_kernel(
+    constexpr int TCGEN05_BLOCK_M = 128;
+    constexpr int TCGEN05_BLOCK_N = 128;
+    constexpr int TCGEN05_BLOCK_K = 64;
+    constexpr int TCGEN05_ACTIVE_WARPS = 4;
+
+    __device__ void bf16_gemm_bt_tile_tcgen05(
+        const CUtensorMap &A_tmap, int a_row,
+        const CUtensorMap &B_tmap, int b_row,
+        __nv_bfloat16 *__restrict__ out, int out_ld,
+        int N, int K,
+        char *__restrict__ smem_pool,
+        uint32_t taddr
+    ) {
+        int warp_id = threadIdx.x>>5;
+        __nv_bfloat16 *A_smem = reinterpret_cast<__nv_bfloat16 *>(smem_pool);
+        __nv_bfloat16 *B_smem = A_smem + TCGEN05_BLOCK_M*TCGEN05_BLOCK_K;
+
+        #pragma nv_diag_suppress static_var_with_dynamic_init
+        __shared__ barrier mbar;
+
+        if (threadIdx.x == 0) {
+            mbar.init(1);
+            asm volatile("fence.mbarrier_init.release.cluster;");
+        }
+        __syncthreads();
+
+        int phase = 0;
+        const uint32_t i_desc = tcgen05::encode_idesc_format_1(TCGEN05_BLOCK_M, TCGEN05_BLOCK_N);
+        const int n_chunks = N / TCGEN05_BLOCK_N;
+        const int num_iters = K / TCGEN05_BLOCK_K;
+
+        for (int nc = 0; nc < n_chunks; nc++) {
+            for (int iter_k = 0; iter_k < num_iters; iter_k++) {
+                if (warp_id == 0 && threadIdx.x == 0) {
+                    for (int k = 0; k < TCGEN05_BLOCK_K/8; k++) {
+                        const int off_k8 = (iter_k*TCGEN05_BLOCK_K + k*8)/8;
+                        cp_async::load3d(A_smem + k*TCGEN05_BLOCK_M*8, &A_tmap, *mbar, 0, a_row, off_k8);
+                        cp_async::load3d(B_smem + k*TCGEN05_BLOCK_N*8, &B_tmap, *mbar, 0, b_row + nc*TCGEN05_BLOCK_N, off_k8);
+                    }
+                    constexpr uint32_t cp_size = (TCGEN05_BLOCK_M + TCGEN05_BLOCK_N)*TCGEN05_BLOCK_K*sizeof(__nv_bfloat16);
+                    mbar.expect_nb(cp_size);
+                }
+                if (warp_id < TCGEN05_ACTIVE_WARPS) {
+                    mbar.await(phase);
+                    tcgen05::after_thread_sync();
+                }
+                phase ^= 1;
+
+                if (warp_id == 0 && threadIdx.x == 0) {
+                    tcgen05::mma_f16(taddr, tcgen05::encode_smem_desc(A_smem, TCGEN05_BLOCK_M),
+                                      tcgen05::encode_smem_desc(B_smem, TCGEN05_BLOCK_N), i_desc, iter_k);
+                    for (int k = 1; k < TCGEN05_BLOCK_K/16; k++) {
+                        tcgen05::mma_f16(
+                            taddr,
+                            tcgen05::encode_smem_desc(A_smem + k*TCGEN05_BLOCK_M*16, TCGEN05_BLOCK_M),
+                            tcgen05::encode_smem_desc(B_smem + k*TCGEN05_BLOCK_N*16, TCGEN05_BLOCK_N),
+                            i_desc, 1);
+                    }
+                    tcgen05::commit_mbarrier(*mbar);
+                }
+                if (warp_id < TCGEN05_ACTIVE_WARPS) mbar.await(phase);
+                phase ^= 1;
+            }
+
+            if (warp_id < TCGEN05_ACTIVE_WARPS) {
+                tcgen05::after_thread_sync();
+                for (int n = 0; n < TCGEN05_BLOCK_N/8; n++) {
+                    float tmp[8];
+                    tcgen05::ld_32x32b_x8(tmp, taddr + ((warp_id*32)<<16) + (n*8));
+                    tcgen05::await_ld();
+
+                    __nv_bfloat162 pk[4];
+                    for (int i = 0; i < 4; i++)
+                        pk[i] = __float22bfloat162_rn({tmp[i*2], tmp[i*2 + 1]});
+
+                    __nv_bfloat16 *out_ptr = out + (int64_t)(warp_id*32 + (threadIdx.x&31))*out_ld + (nc*TCGEN05_BLOCK_N + n*8);
+                    reinterpret_cast<int4 *>(out_ptr)[0] = reinterpret_cast<int4 *>(pk)[0];
+                }
+            }
+            __syncthreads();
+        }
+    }
+
+    __global__ __launch_bounds__(FUSED_THREADS) void fused_dispatch_ffn_kernel(
         const uint8_t *__restrict__ src,
         const int64_t *__restrict__ hidden_peer_ptrs,
         const int64_t *__restrict__ flag_peer_ptrs,
@@ -164,8 +249,14 @@ namespace pi {
         int block_m,
         int n_producer_blocks,
         long long *__restrict__ block_start_clock,
-        long long *__restrict__ block_end_clock
+        long long *__restrict__ block_end_clock,
+        const __grid_constant__ CUtensorMap hidden_tmap,
+        const __grid_constant__ CUtensorMap up_tmap,
+        const __grid_constant__ CUtensorMap gate_tmap,
+        const __grid_constant__ CUtensorMap act_tmap,
+        const __grid_constant__ CUtensorMap down_tmap
     ) {
+        extern __shared__ __align__(1024) char tcgen05_smem[];
         if (threadIdx.x == 0)
             block_start_clock[blockIdx.x] = clock64();
         if ((int)blockIdx.x < n_producer_blocks) {
@@ -194,6 +285,13 @@ namespace pi {
             int slot = (int)blockIdx.x - n_producer_blocks;
             __nv_bfloat16 *my_act = act_scratch + (int64_t)slot*block_m*intermediate_dim;
             __nv_bfloat16 *my_gate = gate_proj != nullptr ? gate_scratch + (int64_t)slot*block_m*intermediate_dim : nullptr;
+            int tcgen05_warp_id = threadIdx.x>>5;
+            #pragma nv_diag_suppress static_var_with_dynamic_init
+            __shared__ int tcgen05_tmem_addr;
+            if (tcgen05_warp_id == 1) tcgen05::tmem_alloc(&tcgen05_tmem_addr, TCGEN05_BLOCK_N);
+            __syncthreads();
+            const uint32_t tcgen05_taddr = static_cast<uint32_t>(tcgen05_tmem_addr);
+
             for (int64_t tile = slot; tile < n_recv_tiles; tile += n_consumer_blocks) {
                 if (recv_tile_valid[tile] == 0) continue;
                 __shared__ int ready;
@@ -204,13 +302,11 @@ namespace pi {
                 __syncthreads();
                 (void)ready;
                 int32_t e = recv_tile_to_local_expert[tile];
-                const __nv_bfloat16 *hidden_tile = recv_hidden + tile*(int64_t)block_m*hidden_dim;
-                const __nv_bfloat16 *up_e = up_proj + (int64_t)e*intermediate_dim*hidden_dim;
-                const __nv_bfloat16 *down_e = down_proj + (int64_t)e*hidden_dim*intermediate_dim;
-                bf16_gemm_bt_tile(hidden_tile, up_e, my_act, block_m, intermediate_dim, hidden_dim);
+                int a_row = (int)(tile*block_m);
+                int b_row = e*intermediate_dim;
+                bf16_gemm_bt_tile_tcgen05(hidden_tmap, a_row, up_tmap, b_row, my_act, intermediate_dim, intermediate_dim, hidden_dim, tcgen05_smem, tcgen05_taddr);
                 if (gate_proj != nullptr) {
-                    const __nv_bfloat16 *gate_e = gate_proj + (int64_t)e*intermediate_dim*hidden_dim;
-                    bf16_gemm_bt_tile(hidden_tile, gate_e, my_gate, block_m, intermediate_dim, hidden_dim);
+                    bf16_gemm_bt_tile_tcgen05(hidden_tmap, a_row, gate_tmap, b_row, my_gate, intermediate_dim, intermediate_dim, hidden_dim, tcgen05_smem, tcgen05_taddr);
                     __syncthreads();
                     for (int i=threadIdx.x; i < block_m*intermediate_dim; i += blockDim.x) {
                         float g = __bfloat162float(my_gate[i]);
@@ -227,9 +323,14 @@ namespace pi {
                 }
                 __syncthreads();
                 __nv_bfloat16 *out_tile = expert_out + tile*(int64_t)block_m*hidden_dim;
-                bf16_gemm_bt_tile(my_act, down_e, out_tile, block_m, hidden_dim, intermediate_dim);
+                int act_row = slot*block_m;
+                bf16_gemm_bt_tile_tcgen05(act_tmap, act_row, down_tmap, e*hidden_dim, out_tile, hidden_dim, hidden_dim, intermediate_dim, tcgen05_smem, tcgen05_taddr);
                 __syncthreads();
             }
+
+            __syncthreads();
+            if (tcgen05_warp_id == 0)
+                tcgen05::tmem_free(tcgen05_taddr, TCGEN05_BLOCK_N);
         }
         __syncthreads();
         if (threadIdx.x == 0)
@@ -583,13 +684,30 @@ void launch_fused_dispatch_ffn(
     int n_consumer_blocks,
     long long *block_start_clock,
     long long *block_end_clock,
+    int64_t dispatch_capacity,
+    int64_t num_local_experts,
     cudaStream_t stream
 ) {
     int total_blocks = n_producer_blocks + n_consumer_blocks;
     if (total_blocks <= 0) {
         return;
     }
-    fused_dispatch_ffn_kernel<<<total_blocks, FUSED_THREADS, 0, stream>>>(
+
+    auto make_tmap = [](const char *name, const void *ptr, int64_t rows, int width) {
+        return init_tmap_kmajor_3d(name, ptr, rows, width, TCGEN05_BLOCK_M, 8);
+    };
+    CUtensorMap hidden_tmap = make_tmap("comet_scatter.hidden", recv_hidden_bf16, dispatch_capacity, hidden_dim);
+    CUtensorMap up_tmap = make_tmap("comet_scatter.up_proj", up_proj_bf16, num_local_experts*intermediate_dim, hidden_dim);
+    CUtensorMap gate_tmap = gate_proj_bf16 != nullptr
+        ? make_tmap("comet_scatter.gate_proj", gate_proj_bf16, num_local_experts*intermediate_dim, hidden_dim)
+        : CUtensorMap{};
+    CUtensorMap act_tmap = make_tmap("comet_scatter.act_scratch", act_scratch_bf16, (int64_t)n_consumer_blocks*block_m, intermediate_dim);
+    CUtensorMap down_tmap = make_tmap("comet_scatter.down_proj", down_proj_bf16, num_local_experts*hidden_dim, intermediate_dim);
+
+    constexpr int smem_size = (TCGEN05_BLOCK_M + TCGEN05_BLOCK_N)*TCGEN05_BLOCK_K*sizeof(__nv_bfloat16);
+    cudaFuncSetAttribute(fused_dispatch_ffn_kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, smem_size);
+
+    fused_dispatch_ffn_kernel<<<total_blocks, FUSED_THREADS, smem_size, stream>>>(
         src, hidden_peer_ptrs, flag_peer_ptrs, tile_peer_rank, tile_local_row_start,
         tile_peer_row_start, tile_valid_rows, tile_flag_index, n_dispatch_tiles, row_bytes,
         static_cast<const __nv_bfloat16 *>(recv_hidden_bf16),
@@ -608,7 +726,12 @@ void launch_fused_dispatch_ffn(
         block_m,
         n_producer_blocks,
         block_start_clock,
-        block_end_clock
+        block_end_clock,
+        hidden_tmap,
+        up_tmap,
+        gate_tmap,
+        act_tmap,
+        down_tmap
     );
 }
 
