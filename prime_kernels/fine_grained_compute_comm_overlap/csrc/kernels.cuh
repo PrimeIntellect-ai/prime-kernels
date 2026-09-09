@@ -69,8 +69,6 @@ namespace pi {
         int block_m,
         int n_producer_blocks,
         int n_consumer_blocks,
-        long long *block_start_clock,
-        long long *block_end_clock,
         int64_t dispatch_capacity,
         int64_t num_local_experts,
         cudaStream_t stream

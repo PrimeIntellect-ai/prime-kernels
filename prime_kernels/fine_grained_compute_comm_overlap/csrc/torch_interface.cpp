@@ -123,8 +123,6 @@ namespace pi {
         torch::Tensor expert_out,
         torch::Tensor act_scratch,
         const c10::optional<torch::Tensor> &gate_scratch,
-        torch::Tensor block_start_clock,
-        torch::Tensor block_end_clock,
         int64_t block_m,
         int64_t n_producer_blocks,
         int64_t n_consumer_blocks
@@ -179,8 +177,6 @@ namespace pi {
             static_cast<int>(block_m),
             static_cast<int>(n_producer_blocks),
             static_cast<int>(n_consumer_blocks),
-            static_cast<long long *>(block_start_clock.mutable_data_ptr()),
-            static_cast<long long *>(block_end_clock.mutable_data_ptr()),
             dispatch_capacity,
             num_local_experts,
             stream
@@ -329,8 +325,6 @@ TORCH_LIBRARY_FRAGMENT(prime_fine_grained_compute_comm_overlap, m) {
         "Tensor(b!) expert_out, "
         "Tensor(c!) act_scratch, "
         "Tensor(d!)? gate_scratch, "
-        "Tensor(e!) block_start_clock, "
-        "Tensor(f!) block_end_clock, "
         "int block_m, "
         "int n_producer_blocks, "
         "int n_consumer_blocks"

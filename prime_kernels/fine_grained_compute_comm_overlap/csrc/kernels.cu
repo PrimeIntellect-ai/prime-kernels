@@ -4,6 +4,9 @@
 #include <cuda_bf16.h>
 #include <mma.h>
 #include "tcgen05_prelude.cuh"
+#include "tiled_pipeline.cuh"
+#include "transport.cuh"
+#include "sched.cuh"
 
 namespace pi {
     namespace {
@@ -222,120 +225,88 @@ namespace pi {
         }
     }
 
-    __global__ __launch_bounds__(FUSED_THREADS) void fused_dispatch_ffn_kernel(
-        const uint8_t *__restrict__ src,
-        const int64_t *__restrict__ hidden_peer_ptrs,
-        const int64_t *__restrict__ flag_peer_ptrs,
-        const int32_t *__restrict__ tile_peer_rank,
-        const int32_t *__restrict__ tile_local_row_start,
-        const int32_t *__restrict__ tile_peer_row_start,
-        const int32_t *__restrict__ tile_valid_rows,
-        const int32_t *__restrict__ tile_flag_index,
-        int64_t n_dispatch_tiles,
-        int64_t row_bytes,
-        const __nv_bfloat16 *__restrict__ recv_hidden,
-        int32_t *__restrict__ recv_flag,
-        const int32_t *__restrict__ recv_tile_valid,
-        const int32_t *__restrict__ recv_tile_to_local_expert,
-        const __nv_bfloat16 *__restrict__ gate_proj,
-        const __nv_bfloat16 *__restrict__ up_proj,
-        const __nv_bfloat16 *__restrict__ down_proj,
-        __nv_bfloat16 *__restrict__ expert_out,
-        __nv_bfloat16 *__restrict__ act_scratch,
-        __nv_bfloat16 *__restrict__ gate_scratch,
-        int64_t n_recv_tiles,
-        int hidden_dim,
-        int intermediate_dim,
-        int block_m,
-        int n_producer_blocks,
-        long long *__restrict__ block_start_clock,
-        long long *__restrict__ block_end_clock,
-        const __grid_constant__ CUtensorMap hidden_tmap,
-        const __grid_constant__ CUtensorMap up_tmap,
-        const __grid_constant__ CUtensorMap gate_tmap,
-        const __grid_constant__ CUtensorMap act_tmap,
-        const __grid_constant__ CUtensorMap down_tmap
-    ) {
-        extern __shared__ __align__(1024) char tcgen05_smem[];
-        if (threadIdx.x == 0)
-            block_start_clock[blockIdx.x] = clock64();
-        if ((int)blockIdx.x < n_producer_blocks) {
-            for (int64_t tile = blockIdx.x; tile < n_dispatch_tiles; tile += n_producer_blocks) {
-                int32_t dest_rank = tile_peer_rank[tile];
-                if (dest_rank < 0) continue;
-                int64_t local_start = tile_local_row_start[tile];
-                int64_t peer_start = tile_peer_row_start[tile];
-                int64_t valid = tile_valid_rows[tile];
-                int32_t flag_idx = tile_flag_index[tile];
-                auto *dest_base = reinterpret_cast<uint8_t *>(hidden_peer_ptrs[dest_rank]);
-                const uint4 *src_vec = reinterpret_cast<const uint4 *>(src + local_start*row_bytes);
-                uint4 *dst_vec = reinterpret_cast<uint4 *>(dest_base + peer_start*row_bytes);
-                int64_t n_vec = (valid*row_bytes)>>4;
-                for (int64_t i=threadIdx.x; i < n_vec; i += blockDim.x)
-                    dst_vec[i] = src_vec[i];
-                __syncthreads();
-                if (threadIdx.x == 0) {
-                    __threadfence_system();
-                    auto *flag_base = reinterpret_cast<int32_t *>(flag_peer_ptrs[dest_rank]);
-                    atomicExch_system(&flag_base[flag_idx], 1);
-                }
-            }
-        } else {
-            int n_consumer_blocks = gridDim.x - n_producer_blocks;
-            int slot = (int)blockIdx.x - n_producer_blocks;
+    // FFN compute policy for tile_pipeline_kernel_hull's consumer role (see tiled_pipeline.cuh):
+    // up/gate/down projection via bf16_gemm_bt_tile_tcgen05, matching pi::tile_compute. This,
+    // together with peer_store_transport (transport.cuh) and round_robin_scheduler (sched.cuh),
+    // replaces the old monolithic fused_dispatch_ffn_kernel __global__ with the generic pipeline.
+    //
+    // ctx.dyn_smem's first 1024 bytes are reserved for the CTA-lifetime tensor-memory address
+    // (tcgen05.alloc happens once in init(), reused by every exec() call, freed once in
+    // epilogue() -- see bf16_gemm_bt_tile_tcgen05's docstring for why repeated alloc/dealloc per
+    // call is illegal); the TMA staging pool for the GEMMs themselves starts right after, at byte
+    // offset 1024 (kept 1024-aligned to match tcgen05_smem's own required alignment).
+    struct ffn_dispatch_compute final {
+        const __nv_bfloat16 *gate_proj;
+        __nv_bfloat16 *expert_out;
+        __nv_bfloat16 *act_scratch;
+        __nv_bfloat16 *gate_scratch;
+        const int32_t *recv_tile_valid;
+        const int32_t *recv_tile_to_local_expert;
+
+        CUtensorMap hidden_tmap;
+        CUtensorMap up_tmap;
+        CUtensorMap gate_tmap;
+        CUtensorMap act_tmap;
+        CUtensorMap down_tmap;
+
+        int hidden_dim;
+        int intermediate_dim;
+        int block_m;
+
+        __device__ bool valid(int64_t tile) const {
+            return recv_tile_valid[tile] != 0;
+        }
+
+        __device__ void init(cta_block_ctx &ctx) const {
+            int warp_id = threadIdx.x>>5;
+            if (warp_id == 1)
+                tcgen05::tmem_alloc(ctx.dyn_smem, TCGEN05_BLOCK_N);
+            __syncthreads();
+        }
+
+        __device__ void exec(int64_t tile, cta_block_ctx &ctx) const {
+            const uint32_t taddr = *static_cast<uint32_t *>(ctx.dyn_smem);
+            char *smem_pool = static_cast<char *>(ctx.dyn_smem) + 1024;
+
+            int32_t e = recv_tile_to_local_expert[tile];
+            int slot = ctx.com_slot;
             __nv_bfloat16 *my_act = act_scratch + (int64_t)slot*block_m*intermediate_dim;
             __nv_bfloat16 *my_gate = gate_proj != nullptr ? gate_scratch + (int64_t)slot*block_m*intermediate_dim : nullptr;
-            int tcgen05_warp_id = threadIdx.x>>5;
-            #pragma nv_diag_suppress static_var_with_dynamic_init
-            __shared__ int tcgen05_tmem_addr;
-            if (tcgen05_warp_id == 1) tcgen05::tmem_alloc(&tcgen05_tmem_addr, TCGEN05_BLOCK_N);
-            __syncthreads();
-            const uint32_t tcgen05_taddr = static_cast<uint32_t>(tcgen05_tmem_addr);
+            int a_row = (int)(tile*block_m);
+            int b_row = e*intermediate_dim;
 
-            for (int64_t tile = slot; tile < n_recv_tiles; tile += n_consumer_blocks) {
-                if (recv_tile_valid[tile] == 0) continue;
-                __shared__ int ready;
-                if (threadIdx.x == 0) {
-                    while (!atomicAdd_system(&recv_flag[tile], 0));
-                    ready = 1;
+            bf16_gemm_bt_tile_tcgen05(hidden_tmap, a_row, up_tmap, b_row, my_act, intermediate_dim, intermediate_dim, hidden_dim, smem_pool, taddr);
+            if (gate_proj != nullptr) {
+                bf16_gemm_bt_tile_tcgen05(hidden_tmap, a_row, gate_tmap, b_row, my_gate, intermediate_dim, intermediate_dim, hidden_dim, smem_pool, taddr);
+                __syncthreads();
+                for (int i=threadIdx.x; i < block_m*intermediate_dim; i += blockDim.x) {
+                    float g = __bfloat162float(my_gate[i]);
+                    float u = __bfloat162float(my_act[i]);
+                    float silu_g = g/(1.0f + __expf(-g));
+                    my_act[i] = __float2bfloat16(silu_g*u);
                 }
+            } else {
                 __syncthreads();
-                (void)ready;
-                int32_t e = recv_tile_to_local_expert[tile];
-                int a_row = (int)(tile*block_m);
-                int b_row = e*intermediate_dim;
-                bf16_gemm_bt_tile_tcgen05(hidden_tmap, a_row, up_tmap, b_row, my_act, intermediate_dim, intermediate_dim, hidden_dim, tcgen05_smem, tcgen05_taddr);
-                if (gate_proj != nullptr) {
-                    bf16_gemm_bt_tile_tcgen05(hidden_tmap, a_row, gate_tmap, b_row, my_gate, intermediate_dim, intermediate_dim, hidden_dim, tcgen05_smem, tcgen05_taddr);
-                    __syncthreads();
-                    for (int i=threadIdx.x; i < block_m*intermediate_dim; i += blockDim.x) {
-                        float g = __bfloat162float(my_gate[i]);
-                        float u = __bfloat162float(my_act[i]);
-                        float silu_g = g/(1.0f + __expf(-g));
-                        my_act[i] = __float2bfloat16(silu_g*u);
-                    }
-                } else {
-                    __syncthreads();
-                    for (int i=threadIdx.x; i < block_m*intermediate_dim; i += blockDim.x) {
-                        float u = __bfloat162float(my_act[i]);
-                        my_act[i] = __float2bfloat16(u/(1.0f + __expf(-u)));
-                    }
+                for (int i=threadIdx.x; i < block_m*intermediate_dim; i += blockDim.x) {
+                    float u = __bfloat162float(my_act[i]);
+                    my_act[i] = __float2bfloat16(u/(1.0f + __expf(-u)));
                 }
-                __syncthreads();
-                __nv_bfloat16 *out_tile = expert_out + tile*(int64_t)block_m*hidden_dim;
-                int act_row = slot*block_m;
-                bf16_gemm_bt_tile_tcgen05(act_tmap, act_row, down_tmap, e*hidden_dim, out_tile, hidden_dim, hidden_dim, intermediate_dim, tcgen05_smem, tcgen05_taddr);
-                __syncthreads();
             }
-
             __syncthreads();
-            if (tcgen05_warp_id == 0)
-                tcgen05::tmem_free(tcgen05_taddr, TCGEN05_BLOCK_N);
+
+            __nv_bfloat16 *out_tile = expert_out + tile*(int64_t)block_m*hidden_dim;
+            int act_row = slot*block_m;
+            bf16_gemm_bt_tile_tcgen05(act_tmap, act_row, down_tmap, e*hidden_dim, out_tile, hidden_dim, hidden_dim, intermediate_dim, smem_pool, taddr);
+            __syncthreads();
         }
-        __syncthreads();
-        if (threadIdx.x == 0)
-            block_end_clock[blockIdx.x] = clock64();
-    }
+
+        __device__ void epilogue(cta_block_ctx &ctx) const {
+            int warp_id = threadIdx.x>>5;
+            const uint32_t taddr = *static_cast<uint32_t *>(ctx.dyn_smem);
+            if (warp_id == 0)
+                tcgen05::tmem_free(taddr, TCGEN05_BLOCK_N);
+        }
+    };
 
     __device__ void bf16_gemm_nn_sum2_tile(
         const __nv_bfloat16 *__restrict__ A1,
@@ -682,8 +653,6 @@ void launch_fused_dispatch_ffn(
     int block_m,
     int n_producer_blocks,
     int n_consumer_blocks,
-    long long *block_start_clock,
-    long long *block_end_clock,
     int64_t dispatch_capacity,
     int64_t num_local_experts,
     cudaStream_t stream
@@ -704,34 +673,52 @@ void launch_fused_dispatch_ffn(
     CUtensorMap act_tmap = make_tmap("fine_grained_compute_comm_overlap.act_scratch", act_scratch_bf16, (int64_t)n_consumer_blocks*block_m, intermediate_dim);
     CUtensorMap down_tmap = make_tmap("fine_grained_compute_comm_overlap.down_proj", down_proj_bf16, num_local_experts*hidden_dim, intermediate_dim);
 
-    constexpr int smem_size = (TCGEN05_BLOCK_M + TCGEN05_BLOCK_N)*TCGEN05_BLOCK_K*sizeof(__nv_bfloat16);
-    cudaFuncSetAttribute(fused_dispatch_ffn_kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, smem_size);
+    peer_store_transport transport{};
+    transport.src = src;
+    transport.hidden_peer_ptrs = hidden_peer_ptrs;
+    transport.flag_peer_ptrs = flag_peer_ptrs;
+    transport.tile_peer_rank = tile_peer_rank;
+    transport.tile_local_row_start = tile_local_row_start;
+    transport.tile_peer_row_start = tile_peer_row_start;
+    transport.tile_valid_rows = tile_valid_rows;
+    transport.tile_flag_index = tile_flag_index;
+    transport.row_bytes = row_bytes;
+    transport.recv_flag = recv_flag;
 
-    fused_dispatch_ffn_kernel<<<total_blocks, FUSED_THREADS, smem_size, stream>>>(
-        src, hidden_peer_ptrs, flag_peer_ptrs, tile_peer_rank, tile_local_row_start,
-        tile_peer_row_start, tile_valid_rows, tile_flag_index, n_dispatch_tiles, row_bytes,
-        static_cast<const __nv_bfloat16 *>(recv_hidden_bf16),
-        recv_flag,
-        recv_tile_valid,
-        recv_tile_to_local_expert,
-        static_cast<const __nv_bfloat16 *>(gate_proj_bf16),
-        static_cast<const __nv_bfloat16 *>(up_proj_bf16),
-        static_cast<const __nv_bfloat16 *>(down_proj_bf16),
-        static_cast<__nv_bfloat16 *>(expert_out_bf16),
-        static_cast<__nv_bfloat16 *>(act_scratch_bf16),
-        static_cast<__nv_bfloat16 *>(gate_scratch_bf16),
-        n_recv_tiles,
-        hidden_dim,
-        intermediate_dim,
-        block_m,
-        n_producer_blocks,
-        block_start_clock,
-        block_end_clock,
-        hidden_tmap,
-        up_tmap,
-        gate_tmap,
-        act_tmap,
-        down_tmap
+    round_robin_scheduler scheduler{};
+    scheduler.n_send_tiles = n_dispatch_tiles;
+    scheduler.n_recv_tiles = n_recv_tiles;
+
+    ffn_dispatch_compute compute{};
+    compute.gate_proj = static_cast<const __nv_bfloat16 *>(gate_proj_bf16);
+    compute.expert_out = static_cast<__nv_bfloat16 *>(expert_out_bf16);
+    compute.act_scratch = static_cast<__nv_bfloat16 *>(act_scratch_bf16);
+    compute.gate_scratch = static_cast<__nv_bfloat16 *>(gate_scratch_bf16);
+    compute.recv_tile_valid = recv_tile_valid;
+    compute.recv_tile_to_local_expert = recv_tile_to_local_expert;
+    compute.hidden_tmap = hidden_tmap;
+    compute.up_tmap = up_tmap;
+    compute.gate_tmap = gate_tmap;
+    compute.act_tmap = act_tmap;
+    compute.down_tmap = down_tmap;
+    compute.hidden_dim = hidden_dim;
+    compute.intermediate_dim = intermediate_dim;
+    compute.block_m = block_m;
+
+    // 1024 reserved bytes for the CTA-lifetime tensor-memory address (see ffn_dispatch_compute's
+    // docstring) + the TMA staging pool bf16_gemm_bt_tile_tcgen05 needs.
+    constexpr size_t smem_size = 1024 + (size_t)(TCGEN05_BLOCK_M + TCGEN05_BLOCK_N)*TCGEN05_BLOCK_K*sizeof(__nv_bfloat16);
+    // launch_tile_pipeline (tiled_pipeline.cuh) doesn't opt the kernel into >48KB dynamic shared
+    // memory itself -- do it here, same as the pre-migration launch did.
+    cudaFuncSetAttribute(
+        tile_pipeline_kernel_hull<peer_store_transport, ffn_dispatch_compute, round_robin_scheduler>,
+        cudaFuncAttributeMaxDynamicSharedMemorySize, static_cast<int>(smem_size)
+    );
+
+    launch_tile_pipeline(
+        transport, compute, scheduler,
+        n_producer_blocks, n_consumer_blocks,
+        FUSED_THREADS, smem_size, stream
     );
 }
 
