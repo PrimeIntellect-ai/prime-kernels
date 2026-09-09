@@ -24,26 +24,26 @@ at::Tensor dequantize_weights_cuda(
     const at::Tensor& block_scales,
     const at::Tensor& global_scales);
 
-TORCH_LIBRARY_FRAGMENT(prime_nvfp4, m) {
+TORCH_LIBRARY_FRAGMENT(prime_rl, m) {
   m.def(
-      "quantize_activations(Tensor matrix, Tensor offsets) -> "
+      "quantize_nvfp4_activations(Tensor matrix, Tensor offsets) -> "
       "(Tensor, Tensor, Tensor)");
   m.def(
-      "quantize_weights(Tensor weight_rows) -> "
+      "quantize_nvfp4_weights(Tensor weight_rows) -> "
       "(Tensor, Tensor, Tensor)");
   m.def(
-      "dequantize_activations(Tensor packed, Tensor block_scales, "
+      "dequantize_nvfp4_activations(Tensor packed, Tensor block_scales, "
       "Tensor global_scales, Tensor offsets) -> Tensor");
   m.def(
-      "dequantize_weights(Tensor packed, Tensor block_scales, "
+      "dequantize_nvfp4_weights(Tensor packed, Tensor block_scales, "
       "Tensor global_scales) -> Tensor");
 }
 
-TORCH_LIBRARY_IMPL(prime_nvfp4, CUDA, m) {
-  m.impl("quantize_activations", quantize_activations_cuda);
-  m.impl("quantize_weights", quantize_weights_cuda);
-  m.impl("dequantize_activations", dequantize_activations_cuda);
-  m.impl("dequantize_weights", dequantize_weights_cuda);
+TORCH_LIBRARY_IMPL(prime_rl, CUDA, m) {
+  m.impl("quantize_nvfp4_activations", quantize_activations_cuda);
+  m.impl("quantize_nvfp4_weights", quantize_weights_cuda);
+  m.impl("dequantize_nvfp4_activations", dequantize_activations_cuda);
+  m.impl("dequantize_nvfp4_weights", dequantize_weights_cuda);
 }
 
 } // namespace prime_kernels::nvfp4
