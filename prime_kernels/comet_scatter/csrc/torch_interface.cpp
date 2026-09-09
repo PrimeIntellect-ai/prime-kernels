@@ -177,6 +177,95 @@ namespace pi {
             stream
         );
     }
+
+    static void fused_grad_combine_ffn_torch_stub(
+        const torch::Tensor &src,
+        const torch::Tensor &hidden_peer_ptrs,
+        const torch::Tensor &flag_peer_ptrs,
+        const torch::Tensor &tile_peer_rank,
+        const torch::Tensor &tile_local_row_start,
+        const torch::Tensor &tile_peer_row_start,
+        const torch::Tensor &tile_valid_rows,
+        const torch::Tensor &tile_flag_index,
+        const torch::Tensor &grad_expert_out_recv,
+        torch::Tensor recv_flag,
+        const torch::Tensor &recv_tile_valid,
+        const torch::Tensor &recv_tile_to_local_expert,
+        const torch::Tensor &hidden_shadow,
+        const c10::optional<torch::Tensor> &gate_proj,
+        const torch::Tensor &up_proj,
+        const torch::Tensor &down_proj,
+        torch::Tensor grad_dispatch_hidden_out,
+        torch::Tensor up_scratch,
+        const c10::optional<torch::Tensor> &gate_scratch,
+        torch::Tensor grad_act_scratch,
+        torch::Tensor act_scratch,
+        torch::Tensor grad_up_proj,
+        torch::Tensor grad_down_proj,
+        const c10::optional<torch::Tensor> &grad_gate_proj,
+        int64_t block_m,
+        int64_t n_producer_blocks,
+        int64_t n_consumer_blocks
+    ) {
+        at::cuda::OptionalCUDAGuard device_guard{device_of(src)};
+        cudaStream_t stream = at::cuda::getCurrentCUDAStream();
+
+        TORCH_CHECK(grad_expert_out_recv.dtype() == torch::kBFloat16, "grad_expert_out_recv must be bf16");
+        TORCH_CHECK(hidden_shadow.dtype() == torch::kBFloat16, "hidden_shadow must be bf16");
+        TORCH_CHECK(up_proj.dtype() == torch::kBFloat16, "up_proj must be bf16");
+        TORCH_CHECK(down_proj.dtype() == torch::kBFloat16, "down_proj must be bf16");
+        TORCH_CHECK(grad_dispatch_hidden_out.is_contiguous(), "grad_dispatch_hidden_out must be contiguous");
+        TORCH_CHECK(grad_up_proj.dtype() == torch::kFloat32, "grad_up_proj must be fp32 (atomic-accumulated)");
+        TORCH_CHECK(grad_down_proj.dtype() == torch::kFloat32, "grad_down_proj must be fp32 (atomic-accumulated)");
+        bool gated = gate_proj.has_value();
+        TORCH_CHECK(gated == gate_scratch.has_value(), "gate_proj and gate_scratch must both be set or both be omitted");
+        TORCH_CHECK(gated == grad_gate_proj.has_value(), "gate_proj and grad_gate_proj must both be set or both be omitted");
+        if (gated) {
+            TORCH_CHECK(grad_gate_proj->dtype() == torch::kFloat32, "grad_gate_proj must be fp32 (atomic-accumulated)");
+        }
+
+        int hidden_dim = static_cast<int>(hidden_shadow.size(1));
+        int intermediate_dim = static_cast<int>(up_proj.size(1));
+        int64_t row_bytes = src.size(1) * src.element_size();
+        int64_t n_dispatch_tiles = tile_peer_rank.numel();
+        int64_t n_recv_tiles = recv_tile_valid.numel();
+
+        pi::launch_fused_grad_combine_ffn(
+            static_cast<const uint8_t *>(src.const_data_ptr()),
+            static_cast<const int64_t *>(hidden_peer_ptrs.const_data_ptr()),
+            static_cast<const int64_t *>(flag_peer_ptrs.const_data_ptr()),
+            static_cast<const int32_t *>(tile_peer_rank.const_data_ptr()),
+            static_cast<const int32_t *>(tile_local_row_start.const_data_ptr()),
+            static_cast<const int32_t *>(tile_peer_row_start.const_data_ptr()),
+            static_cast<const int32_t *>(tile_valid_rows.const_data_ptr()),
+            static_cast<const int32_t *>(tile_flag_index.const_data_ptr()),
+            n_dispatch_tiles,
+            row_bytes,
+            grad_expert_out_recv.const_data_ptr(),
+            static_cast<int32_t *>(recv_flag.mutable_data_ptr()),
+            static_cast<const int32_t *>(recv_tile_valid.const_data_ptr()),
+            static_cast<const int32_t *>(recv_tile_to_local_expert.const_data_ptr()),
+            hidden_shadow.const_data_ptr(),
+            gated ? gate_proj->const_data_ptr() : nullptr,
+            up_proj.const_data_ptr(),
+            down_proj.const_data_ptr(),
+            grad_dispatch_hidden_out.mutable_data_ptr(),
+            up_scratch.mutable_data_ptr(),
+            gated ? gate_scratch->mutable_data_ptr() : nullptr,
+            grad_act_scratch.mutable_data_ptr(),
+            act_scratch.mutable_data_ptr(),
+            static_cast<float *>(grad_up_proj.mutable_data_ptr()),
+            static_cast<float *>(grad_down_proj.mutable_data_ptr()),
+            gated ? static_cast<float *>(grad_gate_proj->mutable_data_ptr()) : nullptr,
+            n_recv_tiles,
+            hidden_dim,
+            intermediate_dim,
+            static_cast<int>(block_m),
+            static_cast<int>(n_producer_blocks),
+            static_cast<int>(n_consumer_blocks),
+            stream
+        );
+    }
 }
 
 TORCH_LIBRARY_FRAGMENT(prime_comet_scatter, m) {
@@ -239,6 +328,38 @@ TORCH_LIBRARY_FRAGMENT(prime_comet_scatter, m) {
         ") -> ()"
     );
     m.impl("fused_dispatch_ffn", torch::kCUDA, &pi::fused_dispatch_ffn_torch_stub);
+
+    m.def("fused_grad_combine_ffn("
+        "Tensor src, "
+        "Tensor hidden_peer_ptrs, "
+        "Tensor flag_peer_ptrs, "
+        "Tensor tile_peer_rank, "
+        "Tensor tile_local_row_start, "
+        "Tensor tile_peer_row_start, "
+        "Tensor tile_valid_rows, "
+        "Tensor tile_flag_index, "
+        "Tensor grad_expert_out_recv, "
+        "Tensor(a!) recv_flag, "
+        "Tensor recv_tile_valid, "
+        "Tensor recv_tile_to_local_expert, "
+        "Tensor hidden_shadow, "
+        "Tensor? gate_proj, "
+        "Tensor up_proj, "
+        "Tensor down_proj, "
+        "Tensor(b!) grad_dispatch_hidden_out, "
+        "Tensor(c!) up_scratch, "
+        "Tensor(d!)? gate_scratch, "
+        "Tensor(e!) grad_act_scratch, "
+        "Tensor(f!) act_scratch, "
+        "Tensor(g!) grad_up_proj, "
+        "Tensor(h!) grad_down_proj, "
+        "Tensor(i!)? grad_gate_proj, "
+        "int block_m, "
+        "int n_producer_blocks, "
+        "int n_consumer_blocks"
+        ") -> ()"
+    );
+    m.impl("fused_grad_combine_ffn", torch::kCUDA, &pi::fused_grad_combine_ffn_torch_stub);
 }
 
 PYBIND11_MODULE(_C, m) {}

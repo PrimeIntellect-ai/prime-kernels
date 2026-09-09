@@ -4,7 +4,7 @@ import torch
 
 from . import _C
 
-__all__ = ["scatter_tiles", "wait_tiles", "wait_and_reduce", "fused_dispatch_ffn"]
+__all__ = ["scatter_tiles", "wait_tiles", "wait_and_reduce", "fused_dispatch_ffn", "fused_grad_combine_ffn"]
 
 
 def scatter_tiles(
@@ -87,4 +87,57 @@ def fused_dispatch_ffn(
         recv_hidden, recv_flag, recv_tile_valid, recv_tile_to_local_expert,
         gate_proj, up_proj, down_proj, expert_out, act_scratch, gate_scratch,
         block_start_clock, block_end_clock, block_m, n_producer_blocks, n_consumer_blocks,
+    )
+
+
+def fused_grad_combine_ffn(
+    src: torch.Tensor,
+    hidden_peer_ptrs: torch.Tensor,
+    flag_peer_ptrs: torch.Tensor,
+    tile_peer_rank: torch.Tensor,
+    tile_local_row_start: torch.Tensor,
+    tile_peer_row_start: torch.Tensor,
+    tile_valid_rows: torch.Tensor,
+    tile_flag_index: torch.Tensor,
+    grad_expert_out_recv: torch.Tensor,
+    recv_flag: torch.Tensor,
+    recv_tile_valid: torch.Tensor,
+    recv_tile_to_local_expert: torch.Tensor,
+    hidden_shadow: torch.Tensor,
+    gate_proj: torch.Tensor | None,
+    up_proj: torch.Tensor,
+    down_proj: torch.Tensor,
+    grad_dispatch_hidden_out: torch.Tensor,
+    up_scratch: torch.Tensor,
+    gate_scratch: torch.Tensor | None,
+    grad_act_scratch: torch.Tensor,
+    act_scratch: torch.Tensor,
+    grad_up_proj: torch.Tensor,
+    grad_down_proj: torch.Tensor,
+    grad_gate_proj: torch.Tensor | None,
+    block_m: int,
+    n_producer_blocks: int,
+    n_consumer_blocks: int,
+) -> None:
+    """Backward mirror of `fused_dispatch_ffn`: producer CTAs scatter a gradient (`src`, e.g.
+    `grad_combine_hidden`) into a peer's symmetric-memory buffer using the *forward* dispatch
+    schedule (role-swapped, same trick `CometMoELayerFunction.backward` already uses for the
+    unfused path); consumer CTAs wait per-tile then compute both the FFN's *input* gradient
+    (`grad_dispatch_hidden_out`) and its *weight* gradients (`grad_up_proj`/`grad_down_proj`/
+    `grad_gate_proj`) via real WMMA GEMMs, recomputing `up`/`gate` from the saved `hidden_shadow`
+    (not saved anywhere else). Weight gradients are accumulated with fp32 atomics into
+    `grad_up_proj`/`grad_down_proj`/`grad_gate_proj` (one expert's tokens span multiple tiles
+    across the grid, hence atomics rather than a plain store) -- these three buffers must be
+    zeroed by the caller before each call, and must be fp32 (cast to the params' own dtype
+    afterwards). Only gated/ungated SiLU is supported. See `kernels.cu`'s
+    `fused_grad_combine_ffn_kernel` docstring for the math.
+    """
+    torch.ops.prime_comet_scatter.fused_grad_combine_ffn(
+        src, hidden_peer_ptrs, flag_peer_ptrs, tile_peer_rank, tile_local_row_start,
+        tile_peer_row_start, tile_valid_rows, tile_flag_index,
+        grad_expert_out_recv, recv_flag, recv_tile_valid, recv_tile_to_local_expert,
+        hidden_shadow, gate_proj, up_proj, down_proj,
+        grad_dispatch_hidden_out, up_scratch, gate_scratch, grad_act_scratch,
+        act_scratch, grad_up_proj, grad_down_proj, grad_gate_proj,
+        block_m, n_producer_blocks, n_consumer_blocks,
     )

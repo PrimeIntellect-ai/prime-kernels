@@ -47,7 +47,10 @@ namespace pi {
         ) {
             for (int64_t t = blockIdx.x*(int64_t)blockDim.x + threadIdx.x; t < n_tiles;
                  t += (int64_t)gridDim.x*blockDim.x) {
-                if (tile_valid[t] != 0) while (!atomicAdd_system(&local_flag[t], 0);
+                if (tile_valid[t] != 0) {
+                    while (!atomicAdd_system(&local_flag[t], 0)) {
+                    }
+                }
             }
         }
         __global__ void wait_and_reduce_kernel(
@@ -232,6 +235,256 @@ namespace pi {
         if (threadIdx.x == 0)
             block_end_clock[blockIdx.x] = clock64();
     }
+
+    __device__ void bf16_gemm_nn_sum2_tile(
+        const __nv_bfloat16 *__restrict__ A1,
+        const __nv_bfloat16 *__restrict__ B1,
+        int K1,
+        const __nv_bfloat16 *__restrict__ A2,
+        const __nv_bfloat16 *__restrict__ B2,
+        int K2,
+        __nv_bfloat16 *__restrict__ out,
+        int M, int N
+    ) {
+        using namespace nvcuda;
+        __shared__ float store_buf[FUSED_MAX_WARPS][WMMA_M][WMMA_N];
+
+        int warp_id = threadIdx.x>>5;
+        int lane = 31&threadIdx.x;
+        int num_warps = blockDim.x>>5;
+        int m_tiles = M / WMMA_M;
+        int n_tiles = N / WMMA_N;
+        int total_tiles = m_tiles*n_tiles;
+
+        for (int t=warp_id; t < total_tiles; t += num_warps) {
+            int mt = t / n_tiles;
+            int nt = t % n_tiles;
+            wmma::fragment<wmma::matrix_a, WMMA_M, WMMA_N, WMMA_K, __nv_bfloat16, wmma::row_major> a_frag;
+            wmma::fragment<wmma::matrix_b, WMMA_M, WMMA_N, WMMA_K, __nv_bfloat16, wmma::row_major> b_frag;
+            wmma::fragment<wmma::accumulator, WMMA_M, WMMA_N, WMMA_K, float> c_frag;
+            wmma::fill_fragment(c_frag, 0.0f);
+            for (int k0=0; k0 < K1; k0 += WMMA_K) {
+                const __nv_bfloat16 *a_ptr = A1 + (int64_t)(mt*WMMA_M)*K1 + k0;
+                const __nv_bfloat16 *b_ptr = B1 + (int64_t)k0*N + nt*WMMA_N;
+                wmma::load_matrix_sync(a_frag, a_ptr, K1);
+                wmma::load_matrix_sync(b_frag, b_ptr, N);
+                wmma::mma_sync(c_frag, a_frag, b_frag, c_frag);
+            }
+            if (A2 != nullptr) {
+                for (int k0=0; k0 < K2; k0 += WMMA_K) {
+                    const __nv_bfloat16 *a_ptr = A2 + (int64_t)(mt*WMMA_M)*K2 + k0;
+                    const __nv_bfloat16 *b_ptr = B2 + (int64_t)k0*N + nt*WMMA_N;
+                    wmma::load_matrix_sync(a_frag, a_ptr, K2);
+                    wmma::load_matrix_sync(b_frag, b_ptr, N);
+                    wmma::mma_sync(c_frag, a_frag, b_frag, c_frag);
+                }
+            }
+            wmma::store_matrix_sync(&store_buf[warp_id][0][0], c_frag, WMMA_N, wmma::mem_row_major);
+            __syncwarp();
+            __nv_bfloat16 *out_tile = out + (int64_t)(mt*WMMA_M)*N + nt*WMMA_N;
+            for (int i=lane; i < WMMA_M*WMMA_N; i += 32) {
+                int r = i / WMMA_N, c = i % WMMA_N;
+                out_tile[(int64_t)r*N + c] = __float2bfloat16(store_buf[warp_id][r][c]);
+            }
+            __syncwarp();
+        }
+    }
+
+    __device__ void bf16_gemm_tn_atomic_tile(
+        const __nv_bfloat16 *__restrict__ A,
+        const __nv_bfloat16 *__restrict__ B,
+        float *__restrict__ out_fp32,
+        int M, int N1, int N2
+    ) {
+        using namespace nvcuda;
+        __shared__ float store_buf[FUSED_MAX_WARPS][WMMA_M][WMMA_N];
+
+        int warp_id = threadIdx.x>>5;
+        int lane = 31&threadIdx.x;
+        int num_warps = blockDim.x>>5;
+        int m_tiles = N1 / WMMA_M;
+        int n_tiles = N2 / WMMA_N;
+        int total_tiles = m_tiles*n_tiles;
+
+        for (int t=warp_id; t < total_tiles; t += num_warps) {
+            int mt = t / n_tiles;
+            int nt = t % n_tiles;
+            wmma::fragment<wmma::matrix_a, WMMA_M, WMMA_N, WMMA_K, __nv_bfloat16, wmma::col_major> a_frag;
+            wmma::fragment<wmma::matrix_b, WMMA_M, WMMA_N, WMMA_K, __nv_bfloat16, wmma::row_major> b_frag;
+            wmma::fragment<wmma::accumulator, WMMA_M, WMMA_N, WMMA_K, float> c_frag;
+            wmma::fill_fragment(c_frag, 0.0f);
+            for (int k0=0; k0 < M; k0 += WMMA_K) {
+                const __nv_bfloat16 *a_ptr = A + (int64_t)k0*N1 + mt*WMMA_M;
+                const __nv_bfloat16 *b_ptr = B + (int64_t)k0*N2 + nt*WMMA_N;
+                wmma::load_matrix_sync(a_frag, a_ptr, N1);
+                wmma::load_matrix_sync(b_frag, b_ptr, N2);
+                wmma::mma_sync(c_frag, a_frag, b_frag, c_frag);
+            }
+            wmma::store_matrix_sync(&store_buf[warp_id][0][0], c_frag, WMMA_N, wmma::mem_row_major);
+            __syncwarp();
+            float *out_tile = out_fp32 + (int64_t)(mt*WMMA_M)*N2 + nt*WMMA_N;
+            for (int i=lane; i < WMMA_M*WMMA_N; i += 32) {
+                int r = i / WMMA_N, c = i % WMMA_N;
+                atomicAdd(&out_tile[(int64_t)r*N2 + c], store_buf[warp_id][r][c]);
+            }
+            __syncwarp();
+        }
+    }
+
+    __global__ void fused_grad_combine_ffn_kernel(
+        const uint8_t *__restrict__ src,
+        const int64_t *__restrict__ hidden_peer_ptrs,
+        const int64_t *__restrict__ flag_peer_ptrs,
+        const int32_t *__restrict__ tile_peer_rank,
+        const int32_t *__restrict__ tile_local_row_start,
+        const int32_t *__restrict__ tile_peer_row_start,
+        const int32_t *__restrict__ tile_valid_rows,
+        const int32_t *__restrict__ tile_flag_index,
+        int64_t n_dispatch_tiles,
+        int64_t row_bytes,
+        const __nv_bfloat16 *__restrict__ grad_expert_out_recv,
+        int32_t *__restrict__ recv_flag,
+        const int32_t *__restrict__ recv_tile_valid,
+        const int32_t *__restrict__ recv_tile_to_local_expert,
+        const __nv_bfloat16 *__restrict__ hidden_shadow,
+        const __nv_bfloat16 *__restrict__ gate_proj,
+        const __nv_bfloat16 *__restrict__ up_proj,
+        const __nv_bfloat16 *__restrict__ down_proj,
+        __nv_bfloat16 *__restrict__ grad_dispatch_hidden_out,
+        __nv_bfloat16 *__restrict__ up_scratch,
+        __nv_bfloat16 *__restrict__ gate_scratch,
+        __nv_bfloat16 *__restrict__ grad_act_scratch,
+        __nv_bfloat16 *__restrict__ act_scratch,
+        float *__restrict__ grad_up_proj_fp32,
+        float *__restrict__ grad_down_proj_fp32,
+        float *__restrict__ grad_gate_proj_fp32,
+        int64_t n_recv_tiles,
+        int hidden_dim,
+        int intermediate_dim,
+        int block_m,
+        int n_producer_blocks
+    ) {
+        if ((int)blockIdx.x < n_producer_blocks) {
+            for (int64_t tile = blockIdx.x; tile < n_dispatch_tiles; tile += n_producer_blocks) {
+                int32_t dest_rank = tile_peer_rank[tile];
+                if (dest_rank < 0) continue;
+                int64_t local_start = tile_local_row_start[tile];
+                int64_t peer_start = tile_peer_row_start[tile];
+                int64_t valid = tile_valid_rows[tile];
+                int32_t flag_idx = tile_flag_index[tile];
+                auto *dest_base = reinterpret_cast<uint8_t *>(hidden_peer_ptrs[dest_rank]);
+                const uint4 *src_vec = reinterpret_cast<const uint4 *>(src + local_start*row_bytes);
+                uint4 *dst_vec = reinterpret_cast<uint4 *>(dest_base + peer_start*row_bytes);
+                int64_t n_vec = (valid*row_bytes)>>4;
+                for (int64_t i=threadIdx.x; i < n_vec; i += blockDim.x)
+                    dst_vec[i] = src_vec[i];
+                __syncthreads();
+                if (threadIdx.x == 0) {
+                    __threadfence_system();
+                    auto *flag_base = reinterpret_cast<int32_t *>(flag_peer_ptrs[dest_rank]);
+                    atomicExch_system(&flag_base[flag_idx], 1);
+                }
+            }
+        } else {
+            int n_consumer_blocks = gridDim.x - n_producer_blocks;
+            int slot = (int)blockIdx.x - n_producer_blocks;
+            __nv_bfloat16 *my_up = up_scratch + (int64_t)slot*block_m*intermediate_dim;
+            __nv_bfloat16 *my_gate = gate_proj != nullptr ? gate_scratch + (int64_t)slot*block_m*intermediate_dim : nullptr;
+            __nv_bfloat16 *my_grad_act = grad_act_scratch + (int64_t)slot*block_m*intermediate_dim;
+            __nv_bfloat16 *my_act = act_scratch + (int64_t)slot*block_m*intermediate_dim;
+
+            for (int64_t tile = slot; tile < n_recv_tiles; tile += n_consumer_blocks) {
+                if (recv_tile_valid[tile] == 0) continue;
+                __shared__ int ready;
+                if (threadIdx.x == 0) {
+                    while (!atomicAdd_system(&recv_flag[tile], 0));
+                    ready = 1;
+                }
+                __syncthreads();
+                (void)ready;
+
+                int32_t e = recv_tile_to_local_expert[tile];
+                const __nv_bfloat16 *hidden_tile = hidden_shadow + tile*(int64_t)block_m*hidden_dim;
+                const __nv_bfloat16 *grad_out_tile = grad_expert_out_recv + tile*(int64_t)block_m*hidden_dim;
+                const __nv_bfloat16 *up_e = up_proj + (int64_t)e*intermediate_dim*hidden_dim;
+                const __nv_bfloat16 *down_e = down_proj + (int64_t)e*hidden_dim*intermediate_dim;
+                bf16_gemm_bt_tile(hidden_tile, up_e, my_up, block_m, intermediate_dim, hidden_dim);
+                if (gate_proj != nullptr) {
+                    const __nv_bfloat16 *gate_e = gate_proj + (int64_t)e*intermediate_dim*hidden_dim;
+                    bf16_gemm_bt_tile(hidden_tile, gate_e, my_gate, block_m, intermediate_dim, hidden_dim);
+                }
+                __syncthreads();
+                bf16_gemm_nn_sum2_tile(
+                    grad_out_tile, down_e, hidden_dim,
+                    nullptr, nullptr, 0,
+                    my_grad_act, block_m, intermediate_dim
+                );
+                __syncthreads();
+                if (gate_proj != nullptr) {
+                    for (int i = threadIdx.x; i < block_m*intermediate_dim; i += blockDim.x) {
+                        float g = __bfloat162float(my_gate[i]);
+                        float u = __bfloat162float(my_up[i]);
+                        float sig = 1.0f/(1.0f + __expf(-g));
+                        my_act[i] = __float2bfloat16(u*g*sig);
+                    }
+                } else {
+                    for (int i = threadIdx.x; i < block_m*intermediate_dim; i += blockDim.x) {
+                        float u = __bfloat162float(my_up[i]);
+                        float sig = 1.0f/(1.0f + __expf(-u));
+                        my_act[i] = __float2bfloat16(u*sig);
+                    }
+                }
+                __syncthreads();
+                bf16_gemm_tn_atomic_tile(
+                    grad_out_tile, my_act,
+                    grad_down_proj_fp32 + (int64_t)e*hidden_dim*intermediate_dim,
+                    block_m, hidden_dim, intermediate_dim
+                );
+                __syncthreads();
+                if (gate_proj != nullptr) {
+                    for (int i = threadIdx.x; i < block_m*intermediate_dim; i += blockDim.x) {
+                        float g = __bfloat162float(my_gate[i]);
+                        float u = __bfloat162float(my_up[i]);
+                        float ga = __bfloat162float(my_grad_act[i]);
+                        float sig = 1.0f/(1.0f + __expf(-g));
+                        float silu_g = g*sig;
+                        float dsilu_g = sig*(1.0f + g*(1.0f - sig));
+                        my_up[i] = __float2bfloat16(ga*silu_g);
+                        my_gate[i] = __float2bfloat16(ga*u*dsilu_g);
+                    }
+                } else {
+                    for (int i = threadIdx.x; i < block_m*intermediate_dim; i += blockDim.x) {
+                        float u = __bfloat162float(my_up[i]);
+                        float ga = __bfloat162float(my_grad_act[i]);
+                        float sig = 1.0f/(1.0f + __expf(-u));
+                        float dsilu_u = sig*(1.0f + u*(1.0f - sig));
+                        my_up[i] = __float2bfloat16(ga*dsilu_u);
+                    }
+                }
+                __syncthreads();
+                __nv_bfloat16 *grad_hidden_tile = grad_dispatch_hidden_out + tile*(int64_t)block_m*hidden_dim;
+                bf16_gemm_nn_sum2_tile(
+                    my_up, up_e, intermediate_dim,
+                    gate_proj != nullptr ? my_gate : nullptr, gate_proj != nullptr ? gate_proj + (int64_t)e*intermediate_dim*hidden_dim : nullptr, intermediate_dim,
+                    grad_hidden_tile, block_m, hidden_dim
+                );
+                __syncthreads();
+                bf16_gemm_tn_atomic_tile(
+                    my_up, hidden_tile,
+                    grad_up_proj_fp32 + (int64_t)e*intermediate_dim*hidden_dim,
+                    block_m, intermediate_dim, hidden_dim
+                );
+                if (gate_proj != nullptr) {
+                    bf16_gemm_tn_atomic_tile(
+                        my_gate, hidden_tile,
+                        grad_gate_proj_fp32 + (int64_t)e*intermediate_dim*hidden_dim,
+                        block_m, intermediate_dim, hidden_dim
+                    );
+                }
+                __syncthreads();
+            }
+        }
+    }
 }
 
 void launch_scatter_tiles(
@@ -356,6 +609,72 @@ void launch_fused_dispatch_ffn(
         n_producer_blocks,
         block_start_clock,
         block_end_clock
+    );
+}
+
+void launch_fused_grad_combine_ffn(
+    const uint8_t *src,
+    const int64_t *hidden_peer_ptrs,
+    const int64_t *flag_peer_ptrs,
+    const int32_t *tile_peer_rank,
+    const int32_t *tile_local_row_start,
+    const int32_t *tile_peer_row_start,
+    const int32_t *tile_valid_rows,
+    const int32_t *tile_flag_index,
+    int64_t n_dispatch_tiles,
+    int64_t row_bytes,
+    const void *grad_expert_out_recv_bf16,
+    int32_t *recv_flag,
+    const int32_t *recv_tile_valid,
+    const int32_t *recv_tile_to_local_expert,
+    const void *hidden_shadow_bf16,
+    const void *gate_proj_bf16,
+    const void *up_proj_bf16,
+    const void *down_proj_bf16,
+    void *grad_dispatch_hidden_out_bf16,
+    void *up_scratch_bf16,
+    void *gate_scratch_bf16,
+    void *grad_act_scratch_bf16,
+    void *act_scratch_bf16,
+    float *grad_up_proj_fp32,
+    float *grad_down_proj_fp32,
+    float *grad_gate_proj_fp32,
+    int64_t n_recv_tiles,
+    int hidden_dim,
+    int intermediate_dim,
+    int block_m,
+    int n_producer_blocks,
+    int n_consumer_blocks,
+    cudaStream_t stream
+) {
+    int total_blocks = n_producer_blocks + n_consumer_blocks;
+    if (total_blocks <= 0) {
+        return;
+    }
+    fused_grad_combine_ffn_kernel<<<total_blocks, FUSED_THREADS, 0, stream>>>(
+        src, hidden_peer_ptrs, flag_peer_ptrs, tile_peer_rank, tile_local_row_start,
+        tile_peer_row_start, tile_valid_rows, tile_flag_index, n_dispatch_tiles, row_bytes,
+        static_cast<const __nv_bfloat16 *>(grad_expert_out_recv_bf16),
+        recv_flag,
+        recv_tile_valid,
+        recv_tile_to_local_expert,
+        static_cast<const __nv_bfloat16 *>(hidden_shadow_bf16),
+        static_cast<const __nv_bfloat16 *>(gate_proj_bf16),
+        static_cast<const __nv_bfloat16 *>(up_proj_bf16),
+        static_cast<const __nv_bfloat16 *>(down_proj_bf16),
+        static_cast<__nv_bfloat16 *>(grad_dispatch_hidden_out_bf16),
+        static_cast<__nv_bfloat16 *>(up_scratch_bf16),
+        static_cast<__nv_bfloat16 *>(gate_scratch_bf16),
+        static_cast<__nv_bfloat16 *>(grad_act_scratch_bf16),
+        static_cast<__nv_bfloat16 *>(act_scratch_bf16),
+        grad_up_proj_fp32,
+        grad_down_proj_fp32,
+        grad_gate_proj_fp32,
+        n_recv_tiles,
+        hidden_dim,
+        intermediate_dim,
+        block_m,
+        n_producer_blocks
     );
 }
 }
