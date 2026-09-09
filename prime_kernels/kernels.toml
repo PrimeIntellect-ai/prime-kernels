@@ -30,6 +30,25 @@ python-only = true
 requires = ["torchao"]
 arch = ["10.0"]
 
+[nvfp4_moe]
+description = "Per-token NVFP4 grouped GEMM with BF16 backward"
+ops = "prime_nvfp4"
+sources = [
+    "csrc/torch_interface.cpp",
+    "csrc/quantize/bindings.cpp",
+    "csrc/quantize/quantize.cu",
+    "csrc/grouped_gemm/bindings.cpp",
+    "csrc/grouped_gemm/f4f4bf16_ultra_grouped.cu",
+    "csrc/grouped_gemm/f4f4bf16_ultra_grouped_256_128_256_2_1_1.cu",
+    "csrc/grouped_gemm/f4f4bf16_ultra_grouped_256_256_256_2_1_1.cu",
+]
+include-dirs = ["csrc/grouped_gemm"]
+include-packages = { cutlass_library = ["source/include", "source/tools/util/include"] }
+arch = ["10.0a"]
+cxx-std = 17
+cxx-flags = ["-O3"]
+nvcc-flags = ["-O3", "--expt-relaxed-constexpr", "--expt-extended-lambda", "--threads=2"]
+
 # rmsnorm is not built yet: only its sources are committed. Uncomment the table below to
 # put it back into the build (and to make the registry report on it).
 #

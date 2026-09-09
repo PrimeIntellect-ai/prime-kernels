@@ -51,11 +51,18 @@ def _skip_reason(kernel, cuda: tuple[int, int] | None) -> str | None:
 
 def _extension(kernel) -> CUDAExtension:
     std = [f"-std=c++{kernel.cxx_std}"]
+    include_dirs = list(kernel.include_dirs)
+    for package, paths in kernel.include_packages.items():
+        spec = importlib.util.find_spec(package)
+        if spec is None or not spec.submodule_search_locations:
+            raise RuntimeError(f"Building {kernel.name} requires the {package} headers package")
+        root = Path(next(iter(spec.submodule_search_locations)))
+        include_dirs.extend(root / path for path in paths)
     return CUDAExtension(
         name=f"{kernel.module}._C",
         # setuptools rejects absolute source paths; everything lives under the repo root.
         sources=[str(source.relative_to(ROOT)) for source in kernel.sources],
-        include_dirs=[str(directory) for directory in kernel.include_dirs],
+        include_dirs=[str(directory) for directory in include_dirs],
         extra_compile_args={
             "cxx": [*std, *kernel.cxx_flags],
             # Explicit -gencode per kernel: TORCH_CUDA_ARCH_LIST is process wide, and one
@@ -98,9 +105,11 @@ setuptools.setup(
     # Listed explicitly: the kernel folders carry C++/CUDA sources next to their Python, and
     # only the Python surface plus the compiled extension belongs in the wheel.
     packages=["prime_kernels", *(f"prime_kernels.{name}" for name in kernels)],
+    exclude_package_data={"prime_kernels.nvfp4_moe": ["csrc/*", "csrc/**/*"]},
     package_data={
         "prime_kernels": ["kernels.toml"],
         "prime_kernels.mxfp8_moe": ["LICENSE.torchao"],
+        "prime_kernels.nvfp4_moe": ["MSLK_LICENSE", "README.md"],
     },
     ext_modules=extensions,
     cmdclass={"build_ext": BuildExtension},

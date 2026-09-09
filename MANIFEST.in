@@ -1,0 +1,1 @@
+recursive-include prime_kernels/nvfp4_moe *.py *.md *.cpp *.cu *.cuh *.h MSLK_LICENSE
