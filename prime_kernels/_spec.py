@@ -60,6 +60,7 @@ class KernelSpec:
     python_only: bool
     requires: tuple[str, ...]
     include_packages: dict[str, tuple[str, ...]]
+    build_requires: tuple[str, ...]
 
     @property
     def module(self) -> str:
@@ -95,4 +96,5 @@ def _kernel(name: str, path: Path, table: dict) -> KernelSpec:
         python_only=table.get("python-only", False),
         requires=tuple(table.get("requires", [])),
         include_packages={name: tuple(paths) for name, paths in table.get("include-packages", {}).items()},
+        build_requires=tuple(table.get("build-requires", [])),
     )

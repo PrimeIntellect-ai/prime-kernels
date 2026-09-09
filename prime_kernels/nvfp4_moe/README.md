@@ -16,12 +16,14 @@ Master parameters and optimizer precision are controlled by the trainer.
 There is no adaptive 4/6 scaling. The Python autograd boundary deliberately
 breaks graph capture; use `fullgraph=False`.
 
-Build with a CUDA development toolkit matching PyTorch's CUDA major, and
-install `nvidia-cutlass==4.2.0.0`, `ninja`, and `wheel` in the build environment:
+Build with a CUDA development toolkit matching PyTorch's CUDA major.
+Kernel-specific dependencies are declared in `kernels.toml` under
+`build-requires`; the build backend installs the dependencies for the selected
+kernels into the isolated build environment:
 
 ```sh
 PRIME_KERNELS=nvfp4_moe PRIME_KERNELS_REQUIRE=1 MAX_JOBS=2 \
-  uv pip install --no-build-isolation .
+  UV_TORCH_BACKEND=cu130 uv build --wheel .
 uv run pytest tests/test_nvfp4_moe.py
 ```
 
