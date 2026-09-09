@@ -705,16 +705,11 @@ void launch_fused_dispatch_ffn(
     compute.intermediate_dim = intermediate_dim;
     compute.block_m = block_m;
 
-    // 1024 reserved bytes for the CTA-lifetime tensor-memory address (see ffn_dispatch_compute's
-    // docstring) + the TMA staging pool bf16_gemm_bt_tile_tcgen05 needs.
     constexpr size_t smem_size = 1024 + (size_t)(TCGEN05_BLOCK_M + TCGEN05_BLOCK_N)*TCGEN05_BLOCK_K*sizeof(__nv_bfloat16);
-    // launch_tile_pipeline (tiled_pipeline.cuh) doesn't opt the kernel into >48KB dynamic shared
-    // memory itself -- do it here, same as the pre-migration launch did.
-    cudaFuncSetAttribute(
+    cudaFuncSetAttribute( // always set mem via func set
         tile_pipeline_kernel_hull<peer_store_transport, ffn_dispatch_compute, round_robin_scheduler>,
         cudaFuncAttributeMaxDynamicSharedMemorySize, static_cast<int>(smem_size)
     );
-
     launch_tile_pipeline(
         transport, compute, scheduler,
         n_producer_blocks, n_consumer_blocks,
