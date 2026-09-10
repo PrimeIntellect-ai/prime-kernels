@@ -8,6 +8,7 @@ def _round_up(value: int, multiple: int) -> int:
 def _quantize_activations_fake(
     matrix: torch.Tensor,
     offsets: torch.Tensor,
+    four_over_six: bool = False,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     rows, contraction_size = matrix.shape
     groups = offsets.shape[0]
@@ -25,6 +26,7 @@ def _quantize_activations_fake(
 
 def _quantize_weights_fake(
     weight_rows: torch.Tensor,
+    four_over_six: bool = False,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     groups, output_size, contraction_size = weight_rows.shape
     padded_output_size = _round_up(output_size, 128)

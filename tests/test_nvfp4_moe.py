@@ -25,13 +25,15 @@ def decode_rows(data, scales, global_scales, rows, k):
 
 
 @pytest.mark.parametrize("k,n", [(64, 96), (2048, 1536), (2688, 3712)])
-def test_nvfp4_forward_and_backward_operands(kernel, k, n):
+@pytest.mark.parametrize("four_over_six", [False, True])
+def test_nvfp4_forward_and_backward_operands(kernel, k, n, four_over_six):
     torch.manual_seed(1729)
     counts = [32, 0, 64]
     offsets = torch.tensor(counts, device="cuda", dtype=torch.int32).cumsum(0, dtype=torch.int32)
     x = (torch.randn(sum(counts), k, device="cuda") * 0.2).bfloat16().requires_grad_()
     w = (torch.randn(3, n, k, device="cuda") * 0.2).bfloat16().transpose(-1, -2).requires_grad_()
-    qx, qw = kernel.quantize_activations(x, offsets), kernel.quantize_weights(w)
+    qx = kernel.quantize_activations(x, offsets, four_over_six=four_over_six)
+    qw = kernel.quantize_weights(w, four_over_six=four_over_six)
     dx, dw = qx.dequantize(), qw.dequantize()
     scale_cols = ((k // 16 + 3) // 4) * 4
     row_start = scale_start = 0
@@ -54,7 +56,7 @@ def test_nvfp4_forward_and_backward_operands(kernel, k, n):
     grad = torch.randn_like(reference)
     for backward in ("dequant_bf16", "bf16"):
         x.grad = w.grad = None
-        y = kernel.grouped_gemm(x, w, offs=offsets, backward=backward)
+        y = kernel.grouped_gemm(x, w, offs=offsets, backward=backward, four_over_six=four_over_six)
         relative_rms = ((y.float() - reference.float()).square().mean() / reference.float().square().mean()).sqrt()
         assert relative_rms < 0.01, relative_rms.item()
         y.backward(grad)
@@ -65,14 +67,15 @@ def test_nvfp4_forward_and_backward_operands(kernel, k, n):
         torch.testing.assert_close(w.grad, expected_dw, rtol=0, atol=0)
 
 
-def test_nvfp4_token_locality_and_zero_rows(kernel):
+@pytest.mark.parametrize("four_over_six", [False, True])
+def test_nvfp4_token_locality_and_zero_rows(kernel, four_over_six):
     torch.manual_seed(41)
     x = torch.randn(64, 256, device="cuda", dtype=torch.bfloat16)
     x[0] = 0
     offsets = torch.tensor([32, 64], device="cuda", dtype=torch.int32)
-    first = kernel.quantize_activations(x, offsets)
+    first = kernel.quantize_activations(x, offsets, four_over_six=four_over_six)
     x[1] *= 1024
-    second = kernel.quantize_activations(x, offsets)
+    second = kernel.quantize_activations(x, offsets, four_over_six=four_over_six)
     keep = torch.arange(64, device="cuda") != 1
     assert torch.equal(first.data.view(torch.uint8)[keep], second.data.view(torch.uint8)[keep])
     assert torch.equal(first.global_scales[keep], second.global_scales[keep])
@@ -82,5 +85,6 @@ def test_nvfp4_token_locality_and_zero_rows(kernel):
         x[:0],
         torch.zeros(2, 256, 256, device="cuda", dtype=torch.bfloat16),
         offs=torch.zeros(2, device="cuda", dtype=torch.int32),
+        four_over_six=four_over_six,
     )
     assert empty.shape == (0, 256)
