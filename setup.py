@@ -70,9 +70,14 @@ kernels = _import_spec_module().load(PACKAGE_DIR)
 selection = {name for name in os.environ.get("PRIME_KERNELS", "").split(",") if name}
 require = os.environ.get("PRIME_KERNELS_REQUIRE") == "1"
 cuda = _nvcc_version()
+unknown = selection - kernels.keys()
+if unknown:
+    raise SystemExit(f"PRIME_KERNELS contains unknown kernel(s): {', '.join(sorted(unknown))}")
 
 extensions, skipped = [], {}
 for name, kernel in kernels.items():
+    if kernel.python_only:
+        continue
     if selection and name not in selection:
         skipped[name] = "not selected by PRIME_KERNELS"
         continue
@@ -84,15 +89,19 @@ for name, kernel in kernels.items():
 
 for name, reason in skipped.items():
     print(f"prime-kernels: skipping {name}: {reason}", file=sys.stderr)
-if require and skipped:
-    raise SystemExit(f"PRIME_KERNELS_REQUIRE=1 but {len(skipped)} kernel(s) were skipped")
+required_skips = {name: reason for name, reason in skipped.items() if not selection or name in selection}
+if require and required_skips:
+    raise SystemExit(f"PRIME_KERNELS_REQUIRE=1 but {len(required_skips)} requested kernel(s) were skipped")
 print(f"prime-kernels: building {', '.join(ext.name for ext in extensions) or '<nothing>'}", file=sys.stderr)
 
 setuptools.setup(
     # Listed explicitly: the kernel folders carry C++/CUDA sources next to their Python, and
     # only the Python surface plus the compiled extension belongs in the wheel.
     packages=["prime_kernels", *(f"prime_kernels.{name}" for name in kernels)],
-    package_data={"prime_kernels": ["kernels.toml"]},
+    package_data={
+        "prime_kernels": ["kernels.toml"],
+        "prime_kernels.mxfp8_moe": ["LICENSE.torchao"],
+    },
     ext_modules=extensions,
     cmdclass={"build_ext": BuildExtension},
 )
