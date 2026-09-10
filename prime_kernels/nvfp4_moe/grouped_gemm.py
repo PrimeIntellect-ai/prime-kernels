@@ -23,9 +23,10 @@ class _GroupedNVFP4MM(torch.autograd.Function):
         weight: torch.Tensor,
         offsets: torch.Tensor,
         backward: NVFP4Backward,
+        four_over_six: bool,
     ) -> torch.Tensor:
-        activations_nvfp4 = quantize_activations(matrix, offsets)
-        weight_nvfp4 = quantize_weights(weight)
+        activations_nvfp4 = quantize_activations(matrix, offsets, four_over_six=four_over_six)
+        weight_nvfp4 = quantize_weights(weight, four_over_six=four_over_six)
         output = _grouped_mm_kernel(
             activations_nvfp4.data,
             weight_nvfp4.data.transpose(-2, -1),
@@ -95,7 +96,7 @@ class _GroupedNVFP4MM(torch.autograd.Function):
                 offs=offsets,
                 out_dtype=torch.bfloat16,
             )
-        return grad_matrix, grad_weight, None, None
+        return grad_matrix, grad_weight, None, None, None
 
 
 def grouped_gemm(
@@ -104,6 +105,7 @@ def grouped_gemm(
     *,
     offs: torch.Tensor,
     backward: NVFP4Backward = "dequant_bf16",
+    four_over_six: bool = False,
 ) -> torch.Tensor:
     """Grouped NVFP4 forward with the selected BF16 backward operands.
 
@@ -111,6 +113,7 @@ def grouped_gemm(
     ``offs`` contains the cumulative row count for each of the ``G`` groups.
     ``dequant_bf16`` reconstructs both operands from the packed forward tensors;
     ``bf16`` retains the original BF16 operands.
+    ``four_over_six`` enables FlashInfer's default 448-bound, MAE 4/6 recipe.
     """
 
     if backward not in ("dequant_bf16", "bf16"):
@@ -123,4 +126,4 @@ def grouped_gemm(
         raise ValueError("matrix and weight contraction dimensions must match")
     if weight.device != matrix.device or weight.dtype != matrix.dtype:
         raise ValueError("weight must have the same CUDA device and dtype as matrix")
-    return _GroupedNVFP4MM.apply(matrix, weight, offs, backward)
+    return _GroupedNVFP4MM.apply(matrix, weight, offs, backward, four_over_six)

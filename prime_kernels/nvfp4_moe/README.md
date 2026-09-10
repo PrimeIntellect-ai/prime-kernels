@@ -13,7 +13,18 @@ and intermediate dimensions must be positive multiples of 32.
 The default backward reconstructs the packed forward operands and computes
 BF16 dgrad and wgrad. `backward="bf16"` uses the original BF16 operands.
 Master parameters and optimizer precision are controlled by the trainer.
-There is no adaptive 4/6 scaling. Use `fullgraph=False` with the trainer.
+Use `fullgraph=False` with the trainer.
+
+`four_over_six=True` enables adaptive map-to-4/map-to-6 scaling for both
+operands, matching FlashInfer's default 4/6 recipe: E4M3 normalization bound
+448, MAE error selection, strict error scoring, and the default approximate
+candidate arithmetic. The option defaults to `False`. The same option is
+available on `quantize_activations` and `quantize_weights`.
+
+On inference, enable `FLASHINFER_NVFP4_4OVER6=1` and leave the other FlashInfer
+NVFP4 options at their defaults. Changing the normalization bound, error metric,
+error-scoring mode, or `FLASHINFER_DISABLE_FP4_QUANT_FAST_MATH` would select a
+different recipe. The quantized layout and backward operands are unchanged.
 
 Build with a CUDA development toolkit matching PyTorch's CUDA major.
 Kernel-specific dependencies are declared in `kernels.toml` under
@@ -27,6 +38,6 @@ uv run pytest tests/test_nvfp4_moe.py
 ```
 
 The grouped GEMM derives from MSLK and retains `MSLK_LICENSE`. The quantizer
-retains the Transformer Engine attribution in its CUDA source. The build
+retains Transformer Engine and FlashInfer attribution in its CUDA source. The build
 uses packaged CUTLASS headers; no compiler or CUTLASS package is needed by a
 finished wheel at runtime.
