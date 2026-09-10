@@ -146,6 +146,12 @@ namespace pi {
     constexpr int TCGEN05_BLOCK_N = 128;
     constexpr int TCGEN05_BLOCK_K = 64;
     constexpr int TCGEN05_ACTIVE_WARPS = 4;
+    constexpr int TCGEN05_STAGES = 2;
+    constexpr int TCGEN05_PROD_WARP = 0;
+    constexpr int TCGEN05_MMA_WARP = 1;
+    constexpr size_t TCGEN05_STAGE_ELEMS = (size_t)TCGEN05_BLOCK_M*TCGEN05_BLOCK_K + (size_t)TCGEN05_BLOCK_N*TCGEN05_BLOCK_K;
+    constexpr size_t TCGEN05_SMEM_BYTES = TCGEN05_STAGES*TCGEN05_STAGE_ELEMS*sizeof(__nv_bfloat16);
+    constexpr size_t GRAD_SMEM_BYTES = (size_t)(TCGEN05_BLOCK_M*16 + 16*TCGEN05_BLOCK_N)*sizeof(__nv_bfloat16);
 
     __device__ void bf16_gemm_bt_tile_tcgen05(
         const CUtensorMap &A_tmap, int a_row,
@@ -155,56 +161,83 @@ namespace pi {
         char *__restrict__ smem_pool,
         uint32_t taddr
     ) {
-        int warp_id = threadIdx.x>>5;
-        __nv_bfloat16 *A_smem = reinterpret_cast<__nv_bfloat16 *>(smem_pool);
-        __nv_bfloat16 *B_smem = A_smem + TCGEN05_BLOCK_M*TCGEN05_BLOCK_K;
+        const int warp_id = threadIdx.x>>5;
+        const int lane_id = 31&threadIdx.x;
+
+        __nv_bfloat16 *smem_base = reinterpret_cast<__nv_bfloat16 *>(smem_pool);
+        auto A_stage = [&](int s) { return smem_base + (size_t)s*TCGEN05_STAGE_ELEMS; };
+        auto B_stage = [&](int s) { return smem_base + (size_t)s*TCGEN05_STAGE_ELEMS + (size_t)TCGEN05_BLOCK_M*TCGEN05_BLOCK_K; };
 
         #pragma nv_diag_suppress static_var_with_dynamic_init
-        __shared__ barrier mbar;
+        __shared__ barrier bar_copy[TCGEN05_STAGES];
+        __shared__ barrier bar_recycle[TCGEN05_STAGES];
+        __shared__ barrier bar_mma[TCGEN05_STAGES];
 
         if (threadIdx.x == 0) {
-            mbar.init(1);
+            for (int i = 0; i < TCGEN05_STAGES; i++) {
+                bar_copy[i].init(1);
+                bar_recycle[i].init(1);
+                bar_mma[i].init(1);
+            }
             asm volatile("fence.mbarrier_init.release.cluster;");
         }
         __syncthreads();
 
-        int phase = 0;
         const uint32_t i_desc = tcgen05::encode_idesc_format_1(TCGEN05_BLOCK_M, TCGEN05_BLOCK_N);
         const int n_chunks = N / TCGEN05_BLOCK_N;
         const int num_iters = K / TCGEN05_BLOCK_K;
 
+        int prod_slot = 0, prod_phase = 0;
+        int mma_slot = 0, mma_phase = 0;
+        bool primed = false;
+
         for (int nc = 0; nc < n_chunks; nc++) {
-            for (int iter_k = 0; iter_k < num_iters; iter_k++) {
-                if (warp_id == 0 && threadIdx.x == 0) {
+            if (warp_id == TCGEN05_PROD_WARP && lane_id == 0) {
+                if (!primed) {
+                    const int total_iters = n_chunks*num_iters;
+                    const int prime_count = total_iters < TCGEN05_STAGES ? total_iters : TCGEN05_STAGES;
+                    for (int s = 0; s < prime_count; s++) bar_recycle[s].arrive();
+                    primed = true;
+                }
+                for (int iter_k = 0; iter_k < num_iters; iter_k++) {
+                    if (prod_slot == TCGEN05_STAGES) { prod_phase ^= 1; prod_slot = 0; }
+                    bar_recycle[prod_slot].await(prod_phase);
+                    __nv_bfloat16 *A_s = A_stage(prod_slot);
+                    __nv_bfloat16 *B_s = B_stage(prod_slot);
                     for (int k = 0; k < TCGEN05_BLOCK_K/8; k++) {
                         const int off_k8 = (iter_k*TCGEN05_BLOCK_K + k*8)/8;
-                        cp_async::load3d(A_smem + k*TCGEN05_BLOCK_M*8, &A_tmap, *mbar, 0, a_row, off_k8);
-                        cp_async::load3d(B_smem + k*TCGEN05_BLOCK_N*8, &B_tmap, *mbar, 0, b_row + nc*TCGEN05_BLOCK_N, off_k8);
+                        cp_async::load3d(A_s + (size_t)k*TCGEN05_BLOCK_M*8, &A_tmap, *bar_copy[prod_slot], 0, a_row, off_k8);
+                        cp_async::load3d(B_s + (size_t)k*TCGEN05_BLOCK_N*8, &B_tmap, *bar_copy[prod_slot], 0, b_row + nc*TCGEN05_BLOCK_N, off_k8);
                     }
                     constexpr uint32_t cp_size = (TCGEN05_BLOCK_M + TCGEN05_BLOCK_N)*TCGEN05_BLOCK_K*sizeof(__nv_bfloat16);
-                    mbar.expect_nb(cp_size);
+                    bar_copy[prod_slot].expect_nb(cp_size);
+                    ++prod_slot;
                 }
-                if (warp_id < TCGEN05_ACTIVE_WARPS) {
-                    mbar.await(phase);
+            } else if (warp_id == TCGEN05_MMA_WARP && lane_id == 0) {
+                int final_slot = 0, final_phase = 0;
+                for (int iter_k = 0; iter_k < num_iters; iter_k++) {
+                    if (mma_slot == TCGEN05_STAGES) { mma_phase ^= 1; mma_slot = 0; }
+                    bar_copy[mma_slot].await(mma_phase);
                     tcgen05::after_thread_sync();
-                }
-                phase ^= 1;
-
-                if (warp_id == 0 && threadIdx.x == 0) {
-                    tcgen05::mma_f16(taddr, tcgen05::encode_smem_desc(A_smem, TCGEN05_BLOCK_M),
-                                      tcgen05::encode_smem_desc(B_smem, TCGEN05_BLOCK_N), i_desc, iter_k);
-                    for (int k = 1; k < TCGEN05_BLOCK_K/16; k++) {
+                    __nv_bfloat16 *A_s = A_stage(mma_slot);
+                    __nv_bfloat16 *B_s = B_stage(mma_slot);
+                    for (int k = 0; k < TCGEN05_BLOCK_K/16; k++) {
                         tcgen05::mma_f16(
                             taddr,
-                            tcgen05::encode_smem_desc(A_smem + k*TCGEN05_BLOCK_M*16, TCGEN05_BLOCK_M),
-                            tcgen05::encode_smem_desc(B_smem + k*TCGEN05_BLOCK_N*16, TCGEN05_BLOCK_N),
-                            i_desc, 1);
+                            tcgen05::encode_smem_desc(A_s + (size_t)k*TCGEN05_BLOCK_M*16, TCGEN05_BLOCK_M),
+                            tcgen05::encode_smem_desc(B_s + (size_t)k*TCGEN05_BLOCK_N*16, TCGEN05_BLOCK_N),
+                            i_desc, (iter_k == 0 && k == 0) ? 0 : 1);
                     }
-                    tcgen05::commit_mbarrier(*mbar);
+                    tcgen05::commit_mbarrier(*bar_recycle[mma_slot]);
+                    tcgen05::commit_mbarrier(*bar_mma[mma_slot]);
+                    final_slot = mma_slot;
+                    final_phase = mma_phase;
+                    ++mma_slot;
                 }
-                if (warp_id < TCGEN05_ACTIVE_WARPS) mbar.await(phase);
-                phase ^= 1;
+                bar_mma[final_slot].await(final_phase);
             }
+            __syncthreads();
+
 
             if (warp_id < TCGEN05_ACTIVE_WARPS) {
                 tcgen05::after_thread_sync();
@@ -225,16 +258,6 @@ namespace pi {
         }
     }
 
-    // FFN compute policy for tile_pipeline_kernel_hull's consumer role (see tiled_pipeline.cuh):
-    // up/gate/down projection via bf16_gemm_bt_tile_tcgen05, matching pi::tile_compute. This,
-    // together with peer_store_transport (transport.cuh) and round_robin_scheduler (sched.cuh),
-    // replaces the old monolithic fused_dispatch_ffn_kernel __global__ with the generic pipeline.
-    //
-    // ctx.dyn_smem's first 1024 bytes are reserved for the CTA-lifetime tensor-memory address
-    // (tcgen05.alloc happens once in init(), reused by every exec() call, freed once in
-    // epilogue() -- see bf16_gemm_bt_tile_tcgen05's docstring for why repeated alloc/dealloc per
-    // call is illegal); the TMA staging pool for the GEMMs themselves starts right after, at byte
-    // offset 1024 (kept 1024-aligned to match tcgen05_smem's own required alignment).
     struct ffn_dispatch_compute final {
         const __nv_bfloat16 *gate_proj;
         __nv_bfloat16 *expert_out;
@@ -308,102 +331,176 @@ namespace pi {
         }
     };
 
-    __device__ void bf16_gemm_nn_sum2_tile(
-        const __nv_bfloat16 *__restrict__ A1,
-        const __nv_bfloat16 *__restrict__ B1,
-        int K1,
-        const __nv_bfloat16 *__restrict__ A2,
-        const __nv_bfloat16 *__restrict__ B2,
-        int K2,
-        __nv_bfloat16 *__restrict__ out,
-        int M, int N
+
+    __device__ __forceinline__ void stage_mnmajor_slab(
+        __nv_bfloat16 *__restrict__ dst, const __nv_bfloat16 *__restrict__ src,
+        int N_total, int n_base, int k_base, int tid, int nthreads
     ) {
-        using namespace nvcuda;
-        __shared__ float store_buf[FUSED_MAX_WARPS][WMMA_M][WMMA_N];
+        for (int i = tid; i < 16*TCGEN05_BLOCK_N; i += nthreads) {
+            int k_local = i/TCGEN05_BLOCK_N, n = i%TCGEN05_BLOCK_N;
+            int addr = (n&7) + (k_local&7)*8 + (n>>3)*64 + (k_local>>3)*1024;
+            dst[addr] = src[(size_t)(k_base+k_local)*N_total + n_base+n];
+        }
+    }
 
-        int warp_id = threadIdx.x>>5;
-        int lane = 31&threadIdx.x;
-        int num_warps = blockDim.x>>5;
-        int m_tiles = M / WMMA_M;
-        int n_tiles = N / WMMA_N;
-        int total_tiles = m_tiles*n_tiles;
+    [[nodiscard]] constexpr __device__ __forceinline__ uint32_t encode_idesc_major(
+        int32_t m, int32_t n, uint32_t a_transposed, uint32_t b_transposed
+    ) {
+        constexpr uint32_t mtype = 1, atype = 1, btype = 1;
+        return
+            ((mtype & 3)<<4) | ((atype & 7)<<7) | ((btype & 7)<<10)
+            | ((a_transposed & 1)<<15) | ((b_transposed & 1)<<16)
+            | (((static_cast<uint32_t>(n)>>3) & 63)<<17)
+            | (((static_cast<uint32_t>(m)>>4) & 31)<<24);
+    }
 
-        for (int t=warp_id; t < total_tiles; t += num_warps) {
-            int mt = t / n_tiles;
-            int nt = t % n_tiles;
-            wmma::fragment<wmma::matrix_a, WMMA_M, WMMA_N, WMMA_K, __nv_bfloat16, wmma::row_major> a_frag;
-            wmma::fragment<wmma::matrix_b, WMMA_M, WMMA_N, WMMA_K, __nv_bfloat16, wmma::row_major> b_frag;
-            wmma::fragment<wmma::accumulator, WMMA_M, WMMA_N, WMMA_K, float> c_frag;
-            wmma::fill_fragment(c_frag, 0.0f);
-            for (int k0=0; k0 < K1; k0 += WMMA_K) {
-                const __nv_bfloat16 *a_ptr = A1 + (int64_t)(mt*WMMA_M)*K1 + k0;
-                const __nv_bfloat16 *b_ptr = B1 + (int64_t)k0*N + nt*WMMA_N;
-                wmma::load_matrix_sync(a_frag, a_ptr, K1);
-                wmma::load_matrix_sync(b_frag, b_ptr, N);
-                wmma::mma_sync(c_frag, a_frag, b_frag, c_frag);
-            }
-            if (A2 != nullptr) {
-                for (int k0=0; k0 < K2; k0 += WMMA_K) {
-                    const __nv_bfloat16 *a_ptr = A2 + (int64_t)(mt*WMMA_M)*K2 + k0;
-                    const __nv_bfloat16 *b_ptr = B2 + (int64_t)k0*N + nt*WMMA_N;
-                    wmma::load_matrix_sync(a_frag, a_ptr, K2);
-                    wmma::load_matrix_sync(b_frag, b_ptr, N);
-                    wmma::mma_sync(c_frag, a_frag, b_frag, c_frag);
+
+    __device__ __noinline__ void bf16_gemm_nn_sum2_tile_tcgen05(
+        const __nv_bfloat16 *__restrict__ A1, const __nv_bfloat16 *__restrict__ B1, int K1,
+        const __nv_bfloat16 *__restrict__ A2, const __nv_bfloat16 *__restrict__ B2, int K2,
+        __nv_bfloat16 *__restrict__ out, int N,
+        char *__restrict__ smem_pool, uint32_t taddr
+    ) {
+        const int tid = threadIdx.x;
+        const int warp_id = tid>>5;
+
+        __nv_bfloat16 *A_s = reinterpret_cast<__nv_bfloat16 *>(smem_pool);
+        __nv_bfloat16 *B_s = A_s + TCGEN05_BLOCK_M*16;
+
+        #pragma nv_diag_suppress static_var_with_dynamic_init
+        __shared__ barrier mbar;
+        if (tid == 0) {
+            mbar.init(1);
+            asm volatile("fence.mbarrier_init.release.cluster;");
+        }
+        __syncthreads();
+
+        const int n_chunks = N/TCGEN05_BLOCK_N;
+        const uint32_t idesc = encode_idesc_major(TCGEN05_BLOCK_M, TCGEN05_BLOCK_N, 0, 1);
+        int phase = 0;
+
+        for (int nc = 0; nc < n_chunks; nc++) {
+            bool accum_start = true;
+            for (int pass = 0; pass < 2; pass++) {
+                if (pass == 1 && A2 == nullptr) continue;
+                const __nv_bfloat16 *A = pass == 0 ? A1 : A2;
+                const __nv_bfloat16 *B = pass == 0 ? B1 : B2;
+                int K = pass == 0 ? K1 : K2;
+                for (int it = 0; it < K/16; it++) {
+                    if (!accum_start && tid == 0) {
+                        mbar.await(phase);
+                        phase ^= 1;
+                    }
+                    __syncthreads();
+                    for (int i = tid; i < TCGEN05_BLOCK_M*16; i += blockDim.x) {
+                        int chunk = i/(TCGEN05_BLOCK_M*8), rem = i%(TCGEN05_BLOCK_M*8);
+                        int row = rem/8, kin = rem%8;
+                        A_s[i] = A[(size_t)row*K + it*16 + chunk*8 + kin];
+                    }
+                    stage_mnmajor_slab(B_s, B, N, nc*TCGEN05_BLOCK_N, it*16, tid, blockDim.x);
+                    __syncthreads();
+                    if (tid == 0) {
+                        uint64_t a_desc = tcgen05::encode_smem_desc(A_s, TCGEN05_BLOCK_M);
+                        uint64_t b_desc = tcgen05::encode_smem_desc(B_s, TCGEN05_BLOCK_N);
+                        tcgen05::mma_f16(taddr, a_desc, b_desc, idesc, accum_start ? 0 : 1);
+                        tcgen05::commit_mbarrier(*mbar);
+                    }
+                    __syncthreads();
+                    accum_start = false;
                 }
             }
-            wmma::store_matrix_sync(&store_buf[warp_id][0][0], c_frag, WMMA_N, wmma::mem_row_major);
-            __syncwarp();
-            __nv_bfloat16 *out_tile = out + (int64_t)(mt*WMMA_M)*N + nt*WMMA_N;
-            for (int i=lane; i < WMMA_M*WMMA_N; i += 32) {
-                int r = i / WMMA_N, c = i % WMMA_N;
-                out_tile[(int64_t)r*N + c] = __float2bfloat16(store_buf[warp_id][r][c]);
+            if (tid == 0) {
+                mbar.await(phase);
+                phase ^= 1;
             }
-            __syncwarp();
+            __syncthreads();
+
+            if (warp_id < TCGEN05_ACTIVE_WARPS) {
+                tcgen05::after_thread_sync();
+                for (int n = 0; n < TCGEN05_BLOCK_N/8; n++) {
+                    float tmp[8];
+                    tcgen05::ld_32x32b_x8(tmp, taddr + ((warp_id*32)<<16) + (n*8));
+                    tcgen05::await_ld();
+                    __nv_bfloat162 pk[4];
+                    for (int i = 0; i < 4; i++)
+                        pk[i] = __float22bfloat162_rn({tmp[i*2], tmp[i*2+1]});
+                    __nv_bfloat16 *out_ptr = out + (int64_t)(warp_id*32 + (tid&31))*N + nc*TCGEN05_BLOCK_N + n*8;
+                    reinterpret_cast<int4 *>(out_ptr)[0] = reinterpret_cast<int4 *>(pk)[0];
+                }
+            }
+            __syncthreads();
         }
     }
 
-    __device__ void bf16_gemm_tn_atomic_tile(
-        const __nv_bfloat16 *__restrict__ A,
-        const __nv_bfloat16 *__restrict__ B,
-        float *__restrict__ out_fp32,
-        int M, int N1, int N2
+    __device__ __noinline__ void bf16_gemm_tn_atomic_tile_tcgen05(
+        const __nv_bfloat16 *__restrict__ A, const __nv_bfloat16 *__restrict__ B,
+        float *__restrict__ out_fp32, int N1, int N2,
+        char *__restrict__ smem_pool, uint32_t taddr
     ) {
-        using namespace nvcuda;
-        __shared__ float store_buf[FUSED_MAX_WARPS][WMMA_M][WMMA_N];
+        const int tid = threadIdx.x;
+        const int warp_id = tid>>5;
 
-        int warp_id = threadIdx.x>>5;
-        int lane = 31&threadIdx.x;
-        int num_warps = blockDim.x>>5;
-        int m_tiles = N1 / WMMA_M;
-        int n_tiles = N2 / WMMA_N;
-        int total_tiles = m_tiles*n_tiles;
+        __nv_bfloat16 *A_s = reinterpret_cast<__nv_bfloat16 *>(smem_pool);
+        __nv_bfloat16 *B_s = A_s + 16*TCGEN05_BLOCK_N;
 
-        for (int t=warp_id; t < total_tiles; t += num_warps) {
-            int mt = t / n_tiles;
-            int nt = t % n_tiles;
-            wmma::fragment<wmma::matrix_a, WMMA_M, WMMA_N, WMMA_K, __nv_bfloat16, wmma::col_major> a_frag;
-            wmma::fragment<wmma::matrix_b, WMMA_M, WMMA_N, WMMA_K, __nv_bfloat16, wmma::row_major> b_frag;
-            wmma::fragment<wmma::accumulator, WMMA_M, WMMA_N, WMMA_K, float> c_frag;
-            wmma::fill_fragment(c_frag, 0.0f);
-            for (int k0=0; k0 < M; k0 += WMMA_K) {
-                const __nv_bfloat16 *a_ptr = A + (int64_t)k0*N1 + mt*WMMA_M;
-                const __nv_bfloat16 *b_ptr = B + (int64_t)k0*N2 + nt*WMMA_N;
-                wmma::load_matrix_sync(a_frag, a_ptr, N1);
-                wmma::load_matrix_sync(b_frag, b_ptr, N2);
-                wmma::mma_sync(c_frag, a_frag, b_frag, c_frag);
+        #pragma nv_diag_suppress static_var_with_dynamic_init
+        __shared__ barrier mbar;
+        if (tid == 0) {
+            mbar.init(1);
+            asm volatile("fence.mbarrier_init.release.cluster;");
+        }
+        __syncthreads();
+
+        const int n1_chunks = N1/TCGEN05_BLOCK_N;
+        const int n2_chunks = N2/TCGEN05_BLOCK_N;
+        const int m_slabs = TCGEN05_BLOCK_M/16;
+        const uint32_t idesc = encode_idesc_major(TCGEN05_BLOCK_N, TCGEN05_BLOCK_N, 1, 1);
+        int phase = 0;
+
+        for (int c1 = 0; c1 < n1_chunks; c1++) {
+            for (int c2 = 0; c2 < n2_chunks; c2++) {
+                for (int ms = 0; ms < m_slabs; ms++) {
+                    if (ms != 0 && tid == 0) {
+                        mbar.await(phase);
+                        phase ^= 1;
+                    }
+                    __syncthreads();
+                    stage_mnmajor_slab(A_s, A, N1, c1*TCGEN05_BLOCK_N, ms*16, tid, blockDim.x);
+                    stage_mnmajor_slab(B_s, B, N2, c2*TCGEN05_BLOCK_N, ms*16, tid, blockDim.x);
+                    __syncthreads();
+                    if (tid == 0) {
+                        uint64_t a_desc = tcgen05::encode_smem_desc(A_s, TCGEN05_BLOCK_N);
+                        uint64_t b_desc = tcgen05::encode_smem_desc(B_s, TCGEN05_BLOCK_N);
+                        tcgen05::mma_f16(taddr, a_desc, b_desc, idesc, ms == 0 ? 0 : 1);
+                        tcgen05::commit_mbarrier(*mbar);
+                    }
+                    __syncthreads();
+                }
+                if (tid == 0) {
+                    mbar.await(phase);
+                    phase ^= 1;
+                }
+                __syncthreads();
+
+                if (warp_id < TCGEN05_ACTIVE_WARPS) {
+                    tcgen05::after_thread_sync();
+                    for (int n = 0; n < TCGEN05_BLOCK_N/8; n++) {
+                        float tmp[8];
+                        tcgen05::ld_32x32b_x8(tmp, taddr + ((warp_id*32)<<16) + (n*8));
+                        tcgen05::await_ld();
+                        float *out_ptr = out_fp32
+                            + (int64_t)(c1*TCGEN05_BLOCK_N + warp_id*32 + (tid&31))*N2
+                            + c2*TCGEN05_BLOCK_N + n*8;
+                        #pragma unroll
+                        for (int k = 0; k < 8; k++) atomicAdd(&out_ptr[k], tmp[k]);
+                    }
+                }
+                __syncthreads();
             }
-            wmma::store_matrix_sync(&store_buf[warp_id][0][0], c_frag, WMMA_N, wmma::mem_row_major);
-            __syncwarp();
-            float *out_tile = out_fp32 + (int64_t)(mt*WMMA_M)*N2 + nt*WMMA_N;
-            for (int i=lane; i < WMMA_M*WMMA_N; i += 32) {
-                int r = i / WMMA_N, c = i % WMMA_N;
-                atomicAdd(&out_tile[(int64_t)r*N2 + c], store_buf[warp_id][r][c]);
-            }
-            __syncwarp();
         }
     }
 
-    __global__ void fused_grad_combine_ffn_kernel(
+    __global__ __launch_bounds__(FUSED_THREADS) void fused_grad_combine_ffn_kernel(
         const uint8_t *__restrict__ src,
         const int64_t *__restrict__ hidden_peer_ptrs,
         const int64_t *__restrict__ flag_peer_ptrs,
@@ -436,6 +533,9 @@ namespace pi {
         int block_m,
         int n_producer_blocks
     ) {
+        extern __shared__ __align__(1024) char grad_dyn_smem[];
+
+
         if ((int)blockIdx.x < n_producer_blocks) {
             for (int64_t tile = blockIdx.x; tile < n_dispatch_tiles; tile += n_producer_blocks) {
                 int32_t dest_rank = tile_peer_rank[tile];
@@ -465,6 +565,11 @@ namespace pi {
             __nv_bfloat16 *my_grad_act = grad_act_scratch + (int64_t)slot*block_m*intermediate_dim;
             __nv_bfloat16 *my_act = act_scratch + (int64_t)slot*block_m*intermediate_dim;
 
+            __shared__ int grad_tmem_addr_s;
+            if ((threadIdx.x>>5) == 1) tcgen05::tmem_alloc(&grad_tmem_addr_s, TCGEN05_BLOCK_N);
+            __syncthreads();
+            const uint32_t grad_taddr = static_cast<uint32_t>(grad_tmem_addr_s);
+
             for (int64_t tile = slot; tile < n_recv_tiles; tile += n_consumer_blocks) {
                 if (recv_tile_valid[tile] == 0) continue;
                 __shared__ int ready;
@@ -486,10 +591,10 @@ namespace pi {
                     bf16_gemm_bt_tile(hidden_tile, gate_e, my_gate, block_m, intermediate_dim, hidden_dim);
                 }
                 __syncthreads();
-                bf16_gemm_nn_sum2_tile(
+                bf16_gemm_nn_sum2_tile_tcgen05(
                     grad_out_tile, down_e, hidden_dim,
                     nullptr, nullptr, 0,
-                    my_grad_act, block_m, intermediate_dim
+                    my_grad_act, intermediate_dim, grad_dyn_smem, grad_taddr
                 );
                 __syncthreads();
                 if (gate_proj != nullptr) {
@@ -507,10 +612,10 @@ namespace pi {
                     }
                 }
                 __syncthreads();
-                bf16_gemm_tn_atomic_tile(
+                bf16_gemm_tn_atomic_tile_tcgen05(
                     grad_out_tile, my_act,
                     grad_down_proj_fp32 + (int64_t)e*hidden_dim*intermediate_dim,
-                    block_m, hidden_dim, intermediate_dim
+                    hidden_dim, intermediate_dim, grad_dyn_smem, grad_taddr
                 );
                 __syncthreads();
                 if (gate_proj != nullptr) {
@@ -535,26 +640,29 @@ namespace pi {
                 }
                 __syncthreads();
                 __nv_bfloat16 *grad_hidden_tile = grad_dispatch_hidden_out + tile*(int64_t)block_m*hidden_dim;
-                bf16_gemm_nn_sum2_tile(
+                bf16_gemm_nn_sum2_tile_tcgen05(
                     my_up, up_e, intermediate_dim,
                     gate_proj != nullptr ? my_gate : nullptr, gate_proj != nullptr ? gate_proj + (int64_t)e*intermediate_dim*hidden_dim : nullptr, intermediate_dim,
-                    grad_hidden_tile, block_m, hidden_dim
+                    grad_hidden_tile, hidden_dim, grad_dyn_smem, grad_taddr
                 );
                 __syncthreads();
-                bf16_gemm_tn_atomic_tile(
+                bf16_gemm_tn_atomic_tile_tcgen05(
                     my_up, hidden_tile,
                     grad_up_proj_fp32 + (int64_t)e*intermediate_dim*hidden_dim,
-                    block_m, intermediate_dim, hidden_dim
+                    intermediate_dim, hidden_dim, grad_dyn_smem, grad_taddr
                 );
                 if (gate_proj != nullptr) {
-                    bf16_gemm_tn_atomic_tile(
+                    bf16_gemm_tn_atomic_tile_tcgen05(
                         my_gate, hidden_tile,
                         grad_gate_proj_fp32 + (int64_t)e*intermediate_dim*hidden_dim,
-                        block_m, intermediate_dim, hidden_dim
+                        intermediate_dim, hidden_dim, grad_dyn_smem, grad_taddr
                     );
                 }
                 __syncthreads();
             }
+            __syncthreads();
+            if (threadIdx.x == 0)
+                tcgen05::tmem_free(grad_taddr, TCGEN05_BLOCK_N);
         }
     }
 }
@@ -705,7 +813,7 @@ void launch_fused_dispatch_ffn(
     compute.intermediate_dim = intermediate_dim;
     compute.block_m = block_m;
 
-    constexpr size_t smem_size = 1024 + (size_t)(TCGEN05_BLOCK_M + TCGEN05_BLOCK_N)*TCGEN05_BLOCK_K*sizeof(__nv_bfloat16);
+    constexpr size_t smem_size = 1024 + TCGEN05_SMEM_BYTES;
     cudaFuncSetAttribute( // always set mem via func set
         tile_pipeline_kernel_hull<peer_store_transport, ffn_dispatch_compute, round_robin_scheduler>,
         cudaFuncAttributeMaxDynamicSharedMemorySize, static_cast<int>(smem_size)
@@ -756,7 +864,11 @@ void launch_fused_grad_combine_ffn(
     if (total_blocks <= 0) {
         return;
     }
-    fused_grad_combine_ffn_kernel<<<total_blocks, FUSED_THREADS, 0, stream>>>(
+    cudaFuncSetAttribute(
+        fused_grad_combine_ffn_kernel,
+        cudaFuncAttributeMaxDynamicSharedMemorySize, static_cast<int>(GRAD_SMEM_BYTES)
+    );
+    fused_grad_combine_ffn_kernel<<<total_blocks, FUSED_THREADS, GRAD_SMEM_BYTES, stream>>>(
         src, hidden_peer_ptrs, flag_peer_ptrs, tile_peer_rank, tile_local_row_start,
         tile_peer_row_start, tile_valid_rows, tile_flag_index, n_dispatch_tiles, row_bytes,
         static_cast<const __nv_bfloat16 *>(grad_expert_out_recv_bf16),
