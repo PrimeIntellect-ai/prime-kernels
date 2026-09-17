@@ -22,7 +22,7 @@ sources = [
     "csrc/kernels/fused_moe_mxfp8_kernel.cu",
 ]
 include-dirs = ["csrc/kernels"]
-arch = ["10.0a"]
+arch = ["10.0a", "10.3a"]
 cxx-std = 20
 
 [mxfp8_moe]
@@ -46,7 +46,7 @@ sources = [
 ]
 include-dirs = ["csrc/grouped_gemm"]
 include-packages = { cutlass_library = ["source/include", "source/tools/util/include"] }
-arch = ["10.0a"]
+arch = ["10.0a", "10.3a"]
 cxx-std = 17
 cxx-flags = ["-O3"]
 nvcc-flags = ["-O3", "--expt-relaxed-constexpr", "--expt-extended-lambda", "--threads=2"]

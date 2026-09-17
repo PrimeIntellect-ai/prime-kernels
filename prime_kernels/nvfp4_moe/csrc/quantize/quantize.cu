@@ -53,8 +53,8 @@ void check_sm100() {
   const auto* properties =
       at::cuda::getDeviceProperties(at::cuda::current_device());
   TORCH_CHECK(
-      properties->major == 10 && properties->minor == 0,
-      "prime-rl-kernels NVFP4 quantization requires SM100, but the current "
+      properties->major == 10 && (properties->minor == 0 || properties->minor == 3),
+      "prime-rl-kernels NVFP4 quantization requires SM100 or SM103, but the current "
       "device is SM",
       properties->major,
       properties->minor,

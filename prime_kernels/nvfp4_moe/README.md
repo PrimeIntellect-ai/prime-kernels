@@ -1,6 +1,6 @@
 # NVFP4 routed-expert GEMM
 
-This SM100 kernel quantizes BF16 inputs and expert weights to E2M1 with
+This SM100/SM103 kernel quantizes BF16 inputs and expert weights to E2M1 with
 block-16 E4M3 scales. Activations have one FP32 outer scale per token; weights
 have one per expert. Gated experts must pass a fused gate/up weight to share
 the outer weight scale.

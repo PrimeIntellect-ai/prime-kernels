@@ -2,7 +2,7 @@
 name = "prime-kernels"
 # The release build appends a `+cu<toolkit>torch<version>` local version, because torch C++
 # extensions are bound to the torch and CUDA they were compiled against.
-version = "0.1.0"
+version = "0.1.0+cu130torch2.13.0.b300.1"
 description = "CUDA kernels for Prime Intellect training stacks"
 readme = "README.md"
 requires-python = "~=3.12.0"

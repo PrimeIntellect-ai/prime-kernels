@@ -45,9 +45,9 @@ def _check_blackwell() -> None:
     if not torch.cuda.is_available():
         raise RuntimeError("NVFP4 quantization requires CUDA")
     capability = torch.cuda.get_device_capability()
-    if capability != (10, 0):
+    if capability not in {(10, 0), (10, 3)}:
         raise RuntimeError(
-            f"NVFP4 quantization currently requires SM100, but the current device is SM{capability[0]}{capability[1]}"
+            f"NVFP4 quantization requires SM100 or SM103, but the current device is SM{capability[0]}{capability[1]}"
         )
     if not hasattr(torch, "float4_e2m1fn_x2"):
         raise RuntimeError("NVFP4 quantization requires PyTorch with float4_e2m1fn_x2 support")

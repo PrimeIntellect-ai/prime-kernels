@@ -32,8 +32,8 @@ Kernel_f4f4bf16_ultra_grouped
 get_ultra_kernel_via_heuristics(int M, int N, int K) {
   const int sm = get_device_sm_version();
   TORCH_CHECK(
-      sm == 100,
-      "prime-rl-kernels NVFP4 grouped GEMM currently requires an sm_100 GPU, "
+      sm == 100 || sm == 103,
+      "prime-rl-kernels NVFP4 grouped GEMM requires an sm_100 or sm_103 GPU, "
       "but the current device is sm_",
       sm,
       ".");
