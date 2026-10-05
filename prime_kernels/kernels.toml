@@ -34,6 +34,11 @@ arch = ["8.0", "9.0", "10.0", "10.3"]
 description = "DeepSeek-V4.1 Lightning Indexer forward fused with top-k and two-level candidate blocks"
 python-only = true
 requires = ["triton"]
+
+[moe_experts]
+description = "Expert MLP of a rank's local experts (grouped GEMMs + fused clamped SwiGLU), forward and backward, on Hopper"
+python-only = true
+requires = ["triton.experimental.gluon"]
 arch = ["9.0"]
 
 # rmsnorm is not built yet: only its sources are committed. Uncomment the table below to
