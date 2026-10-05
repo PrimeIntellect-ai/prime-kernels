@@ -92,6 +92,19 @@ few Triton/Gluon passes: one read of `x` (and of the output gradient) writes bot
 column-quantized copies, the SwiGLU passes quantize their outputs, and DeepGEMM writes the outputs
 in place at the tokens' rows. Hidden and intermediate sizes must be multiples of 128.
 
+`dsa_sparse_attn_bwd` is the backward of DeepSeek-V4.1's sparse attention on Hopper (SM90):
+every query reads its own list of rows of one shared K = V latent buffer (`-1` = empty slot), with
+a per-head attention sink, 64 heads of 512. It is a drop-in for prime-rl's
+`dsv41_sparse_attn_backward` (same inputs, including FlashMLA's sink-free LSE; returns dq, dkv,
+dsinks) as the custom op `prime_kernels::dsa_sparse_attn_bwd` (with a fake impl), and
+`sparse_attn_backward_flat` takes the unbatched layout of cuDNN's `flash_attn_bwd_sm90`. A Triton
+pass computes delta = rowsum(dO * O), the sink-aware LSE and dsinks and compacts each query's
+non-empty slots to the front; the main kernel (CuTe DSL) is a persistent, two-warpgroup kernel
+with one query per iteration: S / dP / softmax / dQ in registers over tiles of 64 gathered latent
+rows, and dKV added with fp32 vector atomics into a buffer that a last Triton pass casts to bf16.
+The atomics (2 KB per query-slot) bound it; at V4.1 shapes it is ~1.2x faster than cuDNN's SM90
+backward (`tests/dsa_sparse_attn_bwd/bench_dsa_sparse_attn_bwd.py`).
+
 `mhc_projection` is DeepSeek-V4.1's manifold-constrained hyper-connection (mHC) projection for
 SM90, forward and backward, in Triton: one pass over the `(tokens, hc_mult, hidden)` streams
 computes the RMS statistic, the projection to the `(2 + hc_mult) * hc_mult` gate logits and the

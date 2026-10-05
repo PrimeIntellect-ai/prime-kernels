@@ -48,6 +48,12 @@ python-only = true
 requires = ["triton"]
 arch = ["9.0"]
 
+[dsa_sparse_attn_bwd]
+description = "DeepSeek-V4.1 sparse attention backward (shared K = V latent, per-query slot lists, attention sink) on Hopper"
+python-only = true
+requires = ["cutlass", "triton"]
+arch = ["9.0"]
+
 # rmsnorm is not built yet: only its sources are committed. Uncomment the table below to
 # put it back into the build (and to make the registry report on it).
 #
