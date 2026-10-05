@@ -42,6 +42,12 @@ python-only = true
 requires = ["triton.experimental.gluon"]
 arch = ["9.0"]
 
+[mhc_projection]
+description = "DeepSeek-V4.1 mHC projection (RMS + gate logits + stream collapse) and gate activations, forward and backward"
+python-only = true
+requires = ["triton"]
+arch = ["9.0"]
+
 # rmsnorm is not built yet: only its sources are committed. Uncomment the table below to
 # put it back into the build (and to make the registry report on it).
 #
