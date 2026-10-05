@@ -37,7 +37,7 @@ requires = ["triton"]
 arch = ["9.0"]
 
 [moe_experts]
-description = "Expert MLP of a rank's local experts (grouped GEMMs + fused clamped SwiGLU), forward and backward, on Hopper"
+description = "Expert MLP of a rank's local experts (grouped GEMMs + fused clamped SwiGLU), forward and backward, on Hopper; bf16, or blockwise FP8 through DeepGEMM"
 python-only = true
 requires = ["triton.experimental.gluon"]
 arch = ["9.0"]

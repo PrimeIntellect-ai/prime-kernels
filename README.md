@@ -84,6 +84,14 @@ The weight gradients use `torch._grouped_mm`. Group sizes must be multiples of
 `moe_experts.TOKEN_GROUP_ALIGNMENT`; `tests/moe_experts/bench_moe_experts.py` compares it with
 `torch._grouped_mm` plus an unfused activation.
 
+`moe_experts(..., fp8=True)` runs the same MLP in blockwise FP8 (DeepSeek-V3 recipe: e4m3, 1 x 128
+scales for activations and gradients along each GEMM's K, 128 x 128 for weights, fp32
+accumulation) for the forward, the data gradients and the weight gradients. The GEMMs are
+DeepGEMM's grouped FP8 GEMMs (DeepGEMM must be installed); everything around them is fused into a
+few Triton/Gluon passes: one read of `x` (and of the output gradient) writes both its row- and
+column-quantized copies, the SwiGLU passes quantize their outputs, and DeepGEMM writes the outputs
+in place at the tokens' rows. Hidden and intermediate sizes must be multiples of 128.
+
 `mhc_projection` is DeepSeek-V4.1's manifold-constrained hyper-connection (mHC) projection for
 SM90, forward and backward, in Triton: one pass over the `(tokens, hc_mult, hidden)` streams
 computes the RMS statistic, the projection to the `(2 + hc_mult) * hc_mult` gate logits and the
