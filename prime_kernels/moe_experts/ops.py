@@ -25,21 +25,12 @@ from prime_kernels.moe_experts.kernels import TileTable, zero_tail
 TOKEN_GROUP_ALIGNMENT = 8
 
 _NUM_SMS: dict[int, int] = {}
-_SM_LIMIT: int | None = None
-
-
-def set_num_sms(num_sms: int | None) -> None:
-    """Cap the SMs the persistent GEMMs occupy (None: all), leaving the rest to kernels that run
-    concurrently on other streams, e.g. expert-parallel communication."""
-    global _SM_LIMIT
-    _SM_LIMIT = num_sms
 
 
 def _num_sms(device: torch.device) -> int:
     if device.index not in _NUM_SMS:
         _NUM_SMS[device.index] = torch.cuda.get_device_properties(device).multi_processor_count
-    total = _NUM_SMS[device.index]
-    return total if _SM_LIMIT is None else max(1, min(_SM_LIMIT, total))
+    return _NUM_SMS[device.index]
 
 
 def unsupported_shape_reason(hidden_size: int, intermediate_size: int, fp8: bool = False) -> str | None:
