@@ -64,6 +64,14 @@ for context parallelism without gathering queries.
 It supports SM80, SM90, SM100, and SM103 (B300), and requires TileLang (validated with
 0.1.12). Install TileLang separately; the registry reports it missing when unavailable.
 
+`mhc_projection` is DeepSeek-V4.1's manifold-constrained hyper-connection (mHC) projection for
+SM90, forward and backward, in Triton: one pass over the `(tokens, hc_mult, hidden)` streams
+computes the RMS statistic, the projection to the `(2 + hc_mult) * hc_mult` gate logits and the
+collapse of the streams by the previous sublayer's `pre` gate; a second kernel applies the gate
+activations (sigmoid `pre`/`post`, Sinkhorn `comb`). `hyper_connection` chains both, with
+`torch.library` custom ops (and fake impls) so it can sit inside `torch.compile`d blocks.
+`tests/mhc_projection/bench_mhc_projection.py` compares it against prime-rl's path.
+
 ## Installing
 
 prime-rl's `uv sync --extra kernels` installs the prebuilt wheels attached to a prime-kernels
