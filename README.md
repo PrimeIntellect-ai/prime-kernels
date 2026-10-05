@@ -64,6 +64,18 @@ for context parallelism without gathering queries.
 It supports SM80, SM90, SM100, and SM103 (B300), and requires TileLang (validated with
 0.1.12). Install TileLang separately; the registry reports it missing when unavailable.
 
+`moe_experts` is the expert MLP of a rank's local experts for training on Hopper (SM90):
+`down(silu(min(gate, l)) * clamp(up, -l, l))` over tokens already grouped by expert, the
+DeepSeek-V4 clamped SwiGLU, bf16, differentiable in the tokens and all three weights. It is
+the Hopper counterpart of the expert compute inside cuDNN's MegaMoE (which also fuses the
+cross-GPU dispatch and is Blackwell only); dispatch and routing scores stay with the caller.
+Its grouped GEMMs are persistent, warp-specialized Gluon kernels whose epilogue warpgroup
+applies the SwiGLU (forward) or its derivative (backward, also recomputing the activation)
+while the tensor cores run the next tile, so only `x`, `gate` and `up` are saved for backward.
+The weight gradients use `torch._grouped_mm`. Group sizes must be multiples of
+`moe_experts.TOKEN_GROUP_ALIGNMENT`; `tests/moe_experts/bench_moe_experts.py` compares it with
+`torch._grouped_mm` plus an unfused activation.
+
 ## Installing
 
 prime-rl's `uv sync --extra kernels` installs the prebuilt wheels attached to a prime-kernels
