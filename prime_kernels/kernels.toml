@@ -30,6 +30,12 @@ python-only = true
 requires = ["tilelang"]
 arch = ["8.0", "9.0", "10.0", "10.3"]
 
+[dsa_indexer_topk]
+description = "DeepSeek-V4.1 Lightning Indexer forward fused with top-k and two-level candidate blocks"
+python-only = true
+requires = ["triton"]
+arch = ["9.0"]
+
 # rmsnorm is not built yet: only its sources are committed. Uncomment the table below to
 # put it back into the build (and to make the registry report on it).
 #

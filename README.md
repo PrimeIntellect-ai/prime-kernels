@@ -14,6 +14,7 @@ CUDA kernels for Prime Intellect training stacks, shipped as one wheel, `prime-k
     │   ├── mxfp8.py
     │   └── csrc/             # the C++/CUDA sources compiled into prime_kernels.flash_moe._C
     ├── indexed_attention/    # Python-only TileLang indexed GQA forward + backward
+    ├── dsa_indexer_topk/     # Python-only Triton DeepSeek-V4.1 Lightning Indexer + top-k
     └── rmsnorm/
         ├── __init__.py
         ├── csrc/             # the torch binding
@@ -63,6 +64,13 @@ as well as attention, and accept different query and KV lengths so the caller ca
 for context parallelism without gathering queries.
 It supports SM80, SM90, SM100, and SM103 (B300), and requires TileLang (validated with
 0.1.12). Install TileLang separately; the registry reports it missing when unavailable.
+
+`dsa_indexer_topk` is DeepSeek-V4.1's Lightning Indexer forward fused with its top-k, including
+the two-level candidate-block filter, as a drop-in for prime-rl's `dsv41_index_topk` (same
+arguments, same picks up to ties). It never materializes the `(queries, entries)` score matrix:
+a dense FP8 GEMM keeps only per-group score maxima, the best groups are selected per query, and
+only their entries are rescored and ranked; candidate consumer layers score only their candidate
+entries. Forward only (the indexer is frozen). Triton, validated on SM90 (H200).
 
 ## Installing
 
