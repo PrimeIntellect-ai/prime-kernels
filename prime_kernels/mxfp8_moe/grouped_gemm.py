@@ -7,6 +7,7 @@
 from __future__ import annotations
 
 import torch
+from torch.fx.experimental.symbolic_shapes import guard_or_true
 from torchao.prototype.moe_training.kernels.mxfp8 import (
     mx_block_rearrange_2d_M_groups_cuda,
     mxfp8_quantize_cuda_3d,
@@ -27,7 +28,8 @@ _SCALING_MODE = ScaleCalculationMode.RCEIL
 
 
 def _quantize_rows(x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
-    if x.ndim != 2 or x.numel() < _QUANT_NUMEL_LIMIT:
+    # Unbacked under torch.compile (the routed token count): take the single-call path, no guard.
+    if x.ndim != 2 or guard_or_true(x.numel() < _QUANT_NUMEL_LIMIT):
         return triton_to_mxfp8_dim0(
             x,
             inner_block_size=TOKEN_GROUP_ALIGNMENT,
@@ -75,9 +77,23 @@ def dequantize_rows(data: torch.Tensor, scales: torch.Tensor, dtype: torch.dtype
     )
 
 
+def _pow2_groups(offsets: torch.Tensor) -> torch.Tensor:
+    """Pad group end offsets to a power-of-two count with empty trailing groups.
+
+    torchao's Triton scale-swizzle kernels `tl.arange` over the group count, which Triton only
+    allows for powers of two (e.g. 48 local experts fail). An empty group adds no rows, and the
+    swizzled outputs already reserve per-group slack, so real groups keep their layout.
+    """
+    n = offsets.numel()
+    target = 1 << (n - 1).bit_length()
+    if target == n:
+        return offsets
+    return torch.cat([offsets, offsets[-1:].expand(target - n)])
+
+
 def _rearrange_token_scales(scales: torch.Tensor, offsets: torch.Tensor) -> torch.Tensor:
     if offsets.numel() > _CUDA_REARRANGE_MAX_GROUPS:
-        return triton_mx_block_rearrange_2d_M_groups(scales, offsets)
+        return triton_mx_block_rearrange_2d_M_groups(scales, _pow2_groups(offsets))
     return mx_block_rearrange_2d_M_groups_cuda(scales, offsets)
 
 
@@ -109,16 +125,14 @@ def _forward(input_act: torch.Tensor, weight_t: torch.Tensor, offsets: torch.Ten
 
 def _dgrad(grad_output: torch.Tensor, weight_t: torch.Tensor, offsets: torch.Tensor) -> torch.Tensor:
     grad_data, grad_scales = quantize_rows(grad_output)
-    weight_data, weight_scales = mxfp8_quantize_cuda_3d(
-        weight_t.transpose(-2, -1),
-        TOKEN_GROUP_ALIGNMENT,
-        scaling_mode=_SCALING_MODE.value.lower(),
-    )
+    # The contraction runs over N, so quantize `weight_t` (E, K, N) along N with the same Triton
+    # row quantizer the forward uses; torchao's CuTe-DSL 3D quantizer fails to compile on SM103.
+    weight_data, weight_scales = _quantize_rows(weight_t.contiguous())
     return torch._scaled_grouped_mm(
         grad_data,
-        weight_data,
+        weight_data.transpose(-2, -1),
         _rearrange_token_scales(grad_scales, offsets),
-        weight_scales,
+        triton_mx_block_rearrange_per_group_3d(weight_scales),
         offs=offsets,
         out_dtype=torch.bfloat16,
     )
@@ -146,8 +160,8 @@ def _wgrad(
     grad_weight = torch._scaled_grouped_mm(
         grad_data,
         input_data.transpose(-2, -1),
-        triton_mx_block_rearrange_2d_K_groups(grad_scales, scale_offsets),
-        triton_mx_block_rearrange_2d_K_groups(input_scales, scale_offsets),
+        triton_mx_block_rearrange_2d_K_groups(grad_scales, _pow2_groups(scale_offsets)),
+        triton_mx_block_rearrange_2d_K_groups(input_scales, _pow2_groups(scale_offsets)),
         offs=offsets,
         out_dtype=torch.bfloat16,
     )
