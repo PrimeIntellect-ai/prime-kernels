@@ -21,14 +21,14 @@ sources = [
     "csrc/kernels/fused_moe_mxfp8_kernel.cu",
 ]
 include-dirs = ["csrc/kernels"]
-arch = ["10.0a"]
+arch = ["10.0a", "10.3a"]
 cxx-std = 20
 
 [mxfp8_moe]
 description = "MXFP8 grouped GEMM and expert-parallel transport"
 python-only = true
 requires = ["torchao"]
-arch = ["10.0"]
+arch = ["10.0", "10.3"]
 
 [indexed_attention]
 description = "Training forward and backward for token-indexed grouped-query attention"
