@@ -150,3 +150,24 @@ def test_backward_is_deterministic(mhc):
 
     for first, second in zip(run(), run()):
         assert torch.equal(first, second)
+
+
+def test_streams_view_folds_its_gradient_into_the_backward(mhc):
+    x, weight, pre_mix, _, _ = make_inputs(4096, 4, 5120)
+    other = torch.randn_like(x)  # stands in for the streams' other reader, the post/comb update
+
+    def run(streams_api):
+        if streams_api:
+            mixes, collapsed, streams = mhc.mhc_projection_streams(x, weight, pre_mix, RMS_EPS)
+        else:
+            (mixes, collapsed), streams = mhc.mhc_projection(x, weight, pre_mix, RMS_EPS), x
+        torch.manual_seed(1)
+        cotangents = [torch.randn_like(mixes), torch.randn_like(collapsed), torch.randn_like(x)]
+        outputs = [mixes, collapsed, streams * other]
+        return torch.autograd.grad(outputs, (x, weight, pre_mix), cotangents)
+
+    (x_ref, weight_ref, pre_ref), (x_got, weight_got, pre_got) = run(False), run(True)
+    # The stream gradient is exact; the others are fp32 partial sums whose order follows the autotuned config.
+    assert torch.equal(x_got, x_ref)
+    assert rel_err(weight_got, weight_ref) < 1e-6
+    assert rel_err(pre_got, pre_ref) < 1e-6

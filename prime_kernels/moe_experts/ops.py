@@ -179,6 +179,73 @@ def _moe_experts_fp8_fwd(
     return [out, gate_up, x_t, x_t_sf, w13_t, w13_t_sf, w2_t, w2_t_sf]
 
 
+@torch.library.custom_op("prime_kernels::moe_experts_fp8_quantize_weights", mutates_args=())
+def _moe_experts_fp8_quantize_weights(
+    w1: torch.Tensor, w3: torch.Tensor | None, w2: torch.Tensor
+) -> list[torch.Tensor]:
+    """The FP8 weights `moe_experts_fp8_forward_quantized` reads: the gate/up and down blocks with
+    their scales, then their transposed copies (for the backward) with theirs."""
+    gate_proj, up_proj = _gate_up(w1, w3)
+    with torch.cuda.device(w2.device):
+        w13 = fp8_impl.quantize_weight(gate_proj, up_proj, transposed=True)
+        w2q = fp8_impl.quantize_weight(w2, None, transposed=True)
+    return [*w13[:2], *w2q[:2], *w13[2:], *w2q[2:]]
+
+
+@_moe_experts_fp8_quantize_weights.register_fake
+def _(w1, w3, w2):
+    gate_proj, up_proj = _gate_up(w1, w3)
+    E, I2, H = gate_proj.shape[0], gate_proj.shape[1] + (up_proj.shape[1] if up_proj is not None else 0), w2.shape[1]
+    I, G, f8 = w2.shape[2], fp8_impl.GROUP, torch.float8_e4m3fn
+    return [
+        w2.new_empty(E, I2, H, dtype=f8), w2.new_empty(E, I2 // G, H // G, dtype=torch.float32),
+        w2.new_empty(E, H, I, dtype=f8), w2.new_empty(E, H // G, I // G, dtype=torch.float32),
+        w2.new_empty(E, H, I2, dtype=f8), w2.new_empty(E, H // G, I2 // G, dtype=torch.float32),
+        w2.new_empty(E, I, H, dtype=f8), w2.new_empty(E, I // G, H // G, dtype=torch.float32),
+    ]
+
+
+@torch.library.custom_op("prime_kernels::moe_experts_fp8_forward_quantized", mutates_args=())
+def _moe_experts_fp8_fwd_quantized(
+    x: torch.Tensor,
+    num_tokens_per_expert: torch.Tensor,
+    swiglu_limit: float,
+    w13_q: torch.Tensor,
+    w13_sf: torch.Tensor,
+    w2_q: torch.Tensor,
+    w2_sf: torch.Tensor,
+) -> list[torch.Tensor]:
+    """`moe_experts_fp8_forward` with ``save_for_backward`` from weights quantized ahead (by
+    `moe_experts_fp8_quantize_weights`): out, the padded gate/up GEMM output and ``x`` quantized
+    per column group with its scales. The backward reads the quantized transposed weights too."""
+    _check_groups(num_tokens_per_expert, x.shape[0])
+    num_experts, hidden, intermediate = w2_q.shape
+    if x.shape[0] == 0:
+        Mp = fp8_impl.padded_rows(0, num_experts)
+        return [
+            x.new_empty(x.shape), x.new_zeros(Mp, 2 * intermediate),
+            x.new_zeros(Mp * hidden, dtype=torch.float8_e4m3fn), x.new_zeros(Mp // fp8_impl.GROUP, hidden, dtype=torch.float32),
+        ]
+    with torch.cuda.device(x.device):
+        layout = fp8_impl.Layout(num_tokens_per_expert, x.shape[0])
+        x_q, x_sf, x_t, x_t_sf = fp8_impl.quantize_activation(x, layout, columns=True)
+        gate_up = fp8_impl.padded_gemm(x_q, x_sf, w13_q, w13_sf, layout, 2 * intermediate)
+        del x_q, x_sf
+        h_q, h_sf, h_head, h_head_sf = fp8_impl.swiglu_quantize(gate_up, layout, swiglu_limit)
+        out = fp8_impl.token_gemm(h_q, h_sf, h_head, h_head_sf, w2_q, w2_sf, layout, x.shape[1])
+    return [out, gate_up, x_t, x_t_sf]
+
+
+@_moe_experts_fp8_fwd_quantized.register_fake
+def _(x, num_tokens_per_expert, swiglu_limit, w13_q, w13_sf, w2_q, w2_sf):
+    num_experts, hidden, intermediate = w2_q.shape
+    Mp = fp8_impl.padded_rows(x.shape[0], num_experts)
+    return [
+        x.new_empty(x.shape), x.new_empty(Mp, 2 * intermediate),
+        x.new_empty(Mp * hidden, dtype=torch.float8_e4m3fn), x.new_empty(Mp // fp8_impl.GROUP, hidden, dtype=torch.float32),
+    ]
+
+
 def _fp8_saved(x, w2, save_for_backward):
     """Zeros shaped like what the FP8 forward saves for backward (all empty without saving)."""
     num_experts, hidden, intermediate = w2.shape
@@ -251,6 +318,119 @@ def _(dout, num_tokens_per_expert, gate_up, x_t, x_t_sf, w13_t, w13_t_sf, w2_t, 
         return dx, dout.new_empty(num_experts, two_intermediate, hidden), dout.new_empty(0), dw2
     dw = dout.new_empty(num_experts, intermediate, hidden)
     return dx, dw, dw.clone(), dw2
+
+
+def _fp8_backward_data(dout, num_tokens_per_expert, gate_up, w13_t, w13_t_sf, w2_t, w2_t_sf, swiglu_limit):
+    """dx, then the weight gradients' FP8 operands in the K-grouped layout: ``dout``, ``h`` and
+    ``dgate | dup``, each with its scales."""
+    hidden, intermediate = w13_t.shape[1], w13_t.shape[2] // 2
+    layout = fp8_impl.Layout(num_tokens_per_expert, dout.shape[0])
+    dout_q, dout_sf, dout_t, dout_t_sf = fp8_impl.quantize_activation(dout, layout, columns=True)
+    dh = fp8_impl.padded_gemm(dout_q, dout_sf, w2_t, w2_t_sf, layout, intermediate)
+    del dout_q, dout_sf
+    dgu, dgu_t, h_t = fp8_impl.swiglu_backward_quantize(dh, gate_up, layout, swiglu_limit)
+    del dh
+    dx = fp8_impl.token_gemm(*dgu, w13_t, w13_t_sf, layout, hidden)
+    return dx, layout, (dout_t, dout_t_sf, *h_t, *dgu_t)
+
+
+def _fp8_weight_grad_accumulate(layout, dout_t, dout_t_sf, h_t, h_t_sf, dgu_t, dgu_t_sf, x_t, x_t_sf, dw13, dw2):
+    fp8_impl.weight_grad_accumulate(dout_t, dout_t_sf, h_t, h_t_sf, layout, dw2)
+    fp8_impl.weight_grad_accumulate(dgu_t, dgu_t_sf, x_t, x_t_sf, layout, dw13)
+
+
+@torch.library.custom_op("prime_kernels::moe_experts_fp8_backward_accumulate", mutates_args=("dw13", "dw2"))
+def _moe_experts_fp8_bwd_accumulate(
+    dout: torch.Tensor,
+    num_tokens_per_expert: torch.Tensor,
+    gate_up: torch.Tensor,
+    x_t: torch.Tensor,
+    x_t_sf: torch.Tensor,
+    w13_t: torch.Tensor,
+    w13_t_sf: torch.Tensor,
+    w2_t: torch.Tensor,
+    w2_t_sf: torch.Tensor,
+    swiglu_limit: float,
+    dw13: torch.Tensor,
+    dw2: torch.Tensor,
+) -> torch.Tensor:
+    """`moe_experts_fp8_backward` for packed gate/up weights that adds the weight gradients into
+    the fp32 accumulators ``dw13`` (``[E, 2 * intermediate, hidden]``) and ``dw2``
+    (``[E, hidden, intermediate]``) and returns ``dx``."""
+    dout = dout.contiguous()
+    if dout.shape[0] == 0:
+        return dout.new_empty(dout.shape)
+    with torch.cuda.device(dout.device):
+        dx, layout, operands = _fp8_backward_data(
+            dout, num_tokens_per_expert, gate_up, w13_t, w13_t_sf, w2_t, w2_t_sf, swiglu_limit
+        )
+        _fp8_weight_grad_accumulate(layout, *operands, x_t, x_t_sf, dw13, dw2)
+    return dx
+
+
+@_moe_experts_fp8_bwd_accumulate.register_fake
+def _(dout, num_tokens_per_expert, gate_up, x_t, x_t_sf, w13_t, w13_t_sf, w2_t, w2_t_sf, swiglu_limit, dw13, dw2):
+    return dout.new_empty(dout.shape)
+
+
+@torch.library.custom_op("prime_kernels::moe_experts_fp8_backward_data", mutates_args=())
+def _moe_experts_fp8_bwd_data(
+    dout: torch.Tensor,
+    num_tokens_per_expert: torch.Tensor,
+    gate_up: torch.Tensor,
+    w13_t: torch.Tensor,
+    w13_t_sf: torch.Tensor,
+    w2_t: torch.Tensor,
+    w2_t_sf: torch.Tensor,
+    swiglu_limit: float,
+) -> list[torch.Tensor]:
+    """The data-gradient half of `moe_experts_fp8_backward_accumulate`: ``dx``, then the operands
+    `moe_experts_fp8_weight_grad_accumulate` reads, so a caller can send ``dx`` on before the
+    weight-gradient GEMMs run."""
+    dout = dout.contiguous()
+    if dout.shape[0] == 0:
+        return [dout.new_empty(dout.shape)]
+    with torch.cuda.device(dout.device):
+        dx, _, operands = _fp8_backward_data(
+            dout, num_tokens_per_expert, gate_up, w13_t, w13_t_sf, w2_t, w2_t_sf, swiglu_limit
+        )
+    return [dx, *operands]
+
+
+@_moe_experts_fp8_bwd_data.register_fake
+def _(dout, num_tokens_per_expert, gate_up, w13_t, w13_t_sf, w2_t, w2_t_sf, swiglu_limit):
+    hidden, two_intermediate = w13_t.shape[1], w13_t.shape[2]
+    Mp, G, f8 = fp8_impl.padded_rows(dout.shape[0], w13_t.shape[0]), fp8_impl.GROUP, torch.float8_e4m3fn
+    return [
+        dout.new_empty(dout.shape),
+        dout.new_empty(Mp * hidden, dtype=f8), dout.new_empty(Mp // G, hidden, dtype=torch.float32),
+        dout.new_empty(Mp * two_intermediate // 2, dtype=f8), dout.new_empty(Mp // G, two_intermediate // 2, dtype=torch.float32),
+        dout.new_empty(Mp * two_intermediate, dtype=f8), dout.new_empty(Mp // G, two_intermediate, dtype=torch.float32),
+    ]
+
+
+@torch.library.custom_op("prime_kernels::moe_experts_fp8_weight_grad_accumulate", mutates_args=("dw13", "dw2"))
+def _moe_experts_fp8_wgrad_accumulate(
+    num_tokens_per_expert: torch.Tensor,
+    dout_t: torch.Tensor,
+    dout_t_sf: torch.Tensor,
+    h_t: torch.Tensor,
+    h_t_sf: torch.Tensor,
+    dgu_t: torch.Tensor,
+    dgu_t_sf: torch.Tensor,
+    x_t: torch.Tensor,
+    x_t_sf: torch.Tensor,
+    num_rows: int,
+    dw13: torch.Tensor,
+    dw2: torch.Tensor,
+) -> None:
+    """The weight-gradient half of `moe_experts_fp8_backward_accumulate`, from the operands
+    `moe_experts_fp8_backward_data` returned for the same ``num_rows`` rows."""
+    if num_rows == 0:
+        return
+    with torch.cuda.device(dout_t.device):
+        layout = fp8_impl.Layout(num_tokens_per_expert, num_rows)
+        _fp8_weight_grad_accumulate(layout, dout_t, dout_t_sf, h_t, h_t_sf, dgu_t, dgu_t_sf, x_t, x_t_sf, dw13, dw2)
 
 
 def _fp8_setup_context(ctx, inputs, output):

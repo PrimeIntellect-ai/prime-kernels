@@ -355,6 +355,17 @@ def token_gemm(a, a_sf, head, head_sf, b, b_sf, layout: Layout, out_cols: int) -
     return out
 
 
+def weight_grad_accumulate(a_t, a_t_sf, b_t, b_t_sf, layout: Layout, out: torch.Tensor) -> None:
+    """``out[e] += A_e^T B_e`` in fp32 (``out`` is ``[E, rows, cols]``), straight from DeepGEMM's
+    accumulator, so gradients accumulated over micro-batches need no cast or extra pass."""
+    import deep_gemm
+
+    if out.dtype != torch.float32 or not out.is_contiguous():
+        raise ValueError(f"the accumulator must be contiguous fp32, got {out.dtype}")
+    ks = [layout.Mp] + [0] * (layout.counts.numel() - 1)
+    deep_gemm.k_grouped_fp8_gemm_nt_contiguous((a_t, a_t_sf.T), (b_t, b_t_sf.T), out, ks, layout.ks, out)
+
+
 def weight_grad(a_t, a_t_sf, b_t, b_t_sf, layout: Layout, rows: int, cols: int, split: int | None = None):
     """bf16 ``A_e^T B_e`` (``[E, rows, cols]``) over each expert's tokens, from operands in the
     K-grouped layout; with ``split``, as its ``[E, split, cols]`` and ``[E, rows - split, cols]``

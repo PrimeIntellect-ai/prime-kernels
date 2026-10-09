@@ -135,6 +135,7 @@ def _set_bwd_block_shapes(nargs):
     nargs["w_desc"].block_shape = [block_n, 1, block_d]
     nargs["grad_proj_desc"].block_shape = [block_m, block_n]
     nargs["grad_collapsed_desc"].block_shape = [block_m, block_d]
+    nargs["grad_x_addend_desc"].block_shape = [block_m, 1, block_d]
 
 
 @triton.autotune(
@@ -150,7 +151,7 @@ def _set_bwd_block_shapes(nargs):
         for nw in (4, 8)
         for ns in (2, 3)
     ],
-    key=["HC", "D", "HAS_PRE"],
+    key=["HC", "D", "HAS_PRE", "HAS_ADDEND"],
 )
 @triton.jit
 def _projection_bwd_kernel(
@@ -160,6 +161,7 @@ def _projection_bwd_kernel(
     grad_proj_desc,
     coef_ptr,
     grad_collapsed_desc,
+    grad_x_addend_desc,
     grad_x_desc,
     grad_w_partial_ptr,
     grad_pre_partial_ptr,
@@ -167,6 +169,7 @@ def _projection_bwd_kernel(
     HC: tl.constexpr,
     D: tl.constexpr,
     HAS_PRE: tl.constexpr,
+    HAS_ADDEND: tl.constexpr,
     BLOCK_N: tl.constexpr,
     BLOCK_M: tl.constexpr,
     BLOCK_D: tl.constexpr,
@@ -209,7 +212,12 @@ def _projection_bwd_kernel(
             gram = tl.dot(grad_collapsed, tl.trans(x))
             grad_pre = tl.sum(tl.where(diagonal, gram, 0.0), axis=1)
             tl.store(grad_pre_partial_ptr + (d_block * HC + i) * T + rows, grad_pre, mask=row_mask)
-        grad_x_desc.store([m0, i, d0], grad_x.to(grad_x_desc.dtype).reshape(BLOCK_M, 1, BLOCK_D))
+        grad_x = grad_x.to(grad_x_desc.dtype)
+        if HAS_ADDEND:
+            # Rounded first, then summed as autograd sums two bf16 gradients: bit for bit the same.
+            addend = grad_x_addend_desc.load([m0, i, d0]).reshape(BLOCK_M, BLOCK_D)
+            grad_x = (grad_x.to(tl.float32) + addend.to(tl.float32)).to(grad_x_desc.dtype)
+        grad_x_desc.store([m0, i, d0], grad_x.reshape(BLOCK_M, 1, BLOCK_D))
         grad_w += tl.dot(tl.trans(x), grad_proj)
 
     offs_d = d0 + tl.arange(0, BLOCK_D)
@@ -291,10 +299,12 @@ def mhc_projection_backward(
     rstd: torch.Tensor,
     grad_mixes: torch.Tensor,
     grad_collapsed: torch.Tensor | None,
+    grad_x_addend: torch.Tensor | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     """Returns `(grad_x, grad_weight, grad_pre_mix)`; `grad_pre_mix` is empty without `pre_mix`.
 
-    `grad_weight` is fp32 regardless of the weight dtype.
+    `grad_weight` is fp32 regardless of the weight dtype. `grad_x_addend`, the gradient `x` receives
+    from its other readers, is added into `grad_x` (rounded as two separate bf16 gradients would be).
     """
     tokens, hc, d = x.shape
     n = weight.shape[0]
@@ -313,6 +323,8 @@ def mhc_projection_backward(
     )
     pre = pre_mix.float().contiguous() if has_pre else coef
     grad_collapsed = _aligned(grad_collapsed) if has_pre else x.view(-1, d)
+    has_addend = grad_x_addend is not None
+    grad_x_addend = _aligned(grad_x_addend.view(x.shape)) if has_addend else x
     # Sized for the smallest BLOCK_D and the largest SPLITS the autotuner may pick; only the
     # slots the chosen config writes are summed below.
     max_d_blocks, max_splits = triton.cdiv(d, 64), 16
@@ -326,6 +338,7 @@ def mhc_projection_backward(
         TensorDescriptor.from_tensor(grad_proj, [1, 8]),
         coef,
         TensorDescriptor.from_tensor(grad_collapsed, [1, 8]),
+        TensorDescriptor.from_tensor(grad_x_addend, [1, 1, 8]),
         TensorDescriptor.from_tensor(grad_x, [1, 1, 8]),
         grad_w_partial,
         grad_pre_partial,
@@ -333,6 +346,7 @@ def mhc_projection_backward(
         HC=hc,
         D=d,
         HAS_PRE=has_pre,
+        HAS_ADDEND=has_addend,
         BLOCK_N=BLOCK_N,
     )
     config = _projection_bwd_kernel.best_config.kwargs
@@ -348,7 +362,7 @@ def mhc_projection_backward(
 
 
 @mhc_projection_backward.register_fake
-def _mhc_projection_backward_fake(x, weight, pre_mix, mixes, rstd, grad_mixes, grad_collapsed):
+def _mhc_projection_backward_fake(x, weight, pre_mix, mixes, rstd, grad_mixes, grad_collapsed, grad_x_addend=None):
     grad_pre_mix = (
         x.new_empty(pre_mix.shape, dtype=torch.float32) if pre_mix is not None else x.new_empty(0, dtype=torch.float32)
     )
@@ -391,3 +405,46 @@ def mhc_projection(
     mixes, _, collapsed = mhc_projection_forward(x.reshape(-1, hc, d), weight, flat_pre, eps)
     mixes = mixes.view(*lead, weight.shape[0])
     return mixes, collapsed.view(*lead, d) if pre_mix is not None else None
+
+
+class _ProjectionWithStreams(torch.autograd.Function):
+    """`mhc_projection_forward` that also hands `x` on, as a view, to its other readers.
+
+    The gradient those readers send back reaches this backward as the view's gradient and is added
+    while `grad_x` is written, instead of by autograd in a separate pass over the streams.
+    """
+
+    @staticmethod
+    def forward(ctx, x, weight, pre_mix, eps):
+        mixes, rstd, collapsed = mhc_projection_forward(x, weight, pre_mix, eps)
+        ctx.save_for_backward(x, weight, pre_mix, mixes, rstd)
+        ctx.has_pre = pre_mix is not None
+        return mixes, collapsed, x.view_as(x)
+
+    @staticmethod
+    def backward(ctx, grad_mixes, grad_collapsed, grad_streams):
+        x, weight, pre_mix, mixes, rstd = ctx.saved_tensors
+        if grad_mixes is None:
+            grad_mixes = torch.zeros_like(mixes)
+        grad_x, grad_weight, grad_pre_mix = mhc_projection_backward(
+            x, weight, pre_mix, mixes, rstd, grad_mixes, grad_collapsed if ctx.has_pre else None, grad_streams
+        )
+        grad_pre_mix = grad_pre_mix.to(pre_mix.dtype) if ctx.has_pre else None
+        return grad_x, grad_weight.to(weight.dtype), grad_pre_mix, None
+
+
+def mhc_projection_streams(
+    x: torch.Tensor, weight: torch.Tensor, pre_mix: torch.Tensor | None = None, eps: float = 1e-20
+) -> tuple[torch.Tensor, torch.Tensor | None, torch.Tensor]:
+    """`mhc_projection` plus `x` itself (a view) for the streams' other readers.
+
+    Reading the streams through that view rather than `x` folds their gradient into the projection's
+    backward, which saves autograd's separate sum of the two stream gradients (a full read of both
+    and a write). Values and gradients are bit for bit those of `mhc_projection`.
+    """
+    lead = x.shape[:-2]
+    hc, d = x.shape[-2:]
+    flat_pre = pre_mix.reshape(-1, hc) if pre_mix is not None else None
+    mixes, collapsed, streams = _ProjectionWithStreams.apply(x.reshape(-1, hc, d), weight, flat_pre, eps)
+    mixes = mixes.view(*lead, weight.shape[0])
+    return mixes, collapsed.view(*lead, d) if pre_mix is not None else None, streams.view(x.shape)
