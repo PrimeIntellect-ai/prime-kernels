@@ -30,6 +30,30 @@ python-only = true
 requires = ["tilelang"]
 arch = ["8.0", "9.0", "10.0", "10.3"]
 
+[dsa_indexer_topk]
+description = "DeepSeek-V4.1 Lightning Indexer forward fused with top-k and two-level candidate blocks"
+python-only = true
+requires = ["triton"]
+arch = ["9.0"]
+
+[moe_experts]
+description = "Expert MLP of a rank's local experts (grouped GEMMs + fused clamped SwiGLU), forward and backward, on Hopper; bf16, or blockwise FP8 through DeepGEMM"
+python-only = true
+requires = ["triton.experimental.gluon"]
+arch = ["9.0"]
+
+[mhc_projection]
+description = "DeepSeek-V4.1 mHC projection (RMS + gate logits + stream collapse) and gate activations, forward and backward"
+python-only = true
+requires = ["triton"]
+arch = ["9.0"]
+
+[dsa_sparse_attn_bwd]
+description = "DeepSeek-V4.1 sparse attention backward (shared K = V latent, per-query slot lists, attention sink) on Hopper"
+python-only = true
+requires = ["cutlass", "triton"]
+arch = ["9.0"]
+
 # rmsnorm is not built yet: only its sources are committed. Uncomment the table below to
 # put it back into the build (and to make the registry report on it).
 #
