@@ -8,7 +8,7 @@ prime-rl's tests/unit/train/models/test_fused_moe.py for flash_moe); this only
 guards the thing cross-compilation can't verify on its own: does the compiled
 extension actually load and run on this GPU.
 
-Usage: python smoke_test.py <prime-kernels|deep-ep|deep-gemm|torchao>
+Usage: python smoke_test.py <prime-kernels|deep-ep|deep-ep-v2|deep-gemm|torchao>
 """
 
 import sys
@@ -58,6 +58,24 @@ def smoke_deep_ep():
     # can get wrong (wrong arch, wrong torch ABI), so that's what this checks.
 
 
+def smoke_deep_ep_v2():
+    import ctypes
+
+    # The import runs check_nccl_so (the libnccl torch loaded must be the one deep_ep_v2
+    # links) and init_jit.
+    import deep_ep_v2
+
+    print("deep_ep_v2", deep_ep_v2.__file__)
+    version = ctypes.c_int()
+    ctypes.CDLL("libnccl.so.2").ncclGetVersion(ctypes.byref(version))
+    print("NCCL", version.value)
+    assert version.value >= 23203, f"deep_ep_v2 needs NCCL >= 2.32.3, got {version.value}"
+    # Builds the JIT runtime for this GPU. Kernels compile at first use with nvcc from
+    # CUDA_HOME, which needs CUDA >= 13.1, and real dispatch/combine needs an EP group:
+    # both out of scope here.
+    print("JIT runtime:", deep_ep_v2._C.get_jit())
+
+
 def smoke_torchao():
     import torchao  # noqa: F401
     from torchao.prototype.mx_formats.mx_tensor import MXTensor
@@ -75,6 +93,7 @@ CHECKS = {
     "prime-kernels": smoke_prime_kernels,
     "deep-gemm": smoke_deep_gemm,
     "deep-ep": smoke_deep_ep,
+    "deep-ep-v2": smoke_deep_ep_v2,
     "torchao": smoke_torchao,
 }
 

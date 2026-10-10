@@ -1,12 +1,12 @@
 name: Build and Release Kernels
 
 # Builds every wheel prime-rl (and other consumers) pin via `[tool.uv.sources]`:
-# prime-kernels (this repo's own kernels.toml-declared extensions), deep-ep and
-# deep-gemm (from their pinned deepseek-ai revs), and our torchao (from the pytorch/ao
+# prime-kernels (this repo's own kernels.toml-declared extensions), deep-ep, deep-ep-v2
+# and deep-gemm (from their pinned deepseek-ai revs), and our torchao (from the pytorch/ao
 # rev the MXFP8 training path requires). This repo is the single build+release site for
-# all four — prime-rl only consumes the resulting release, it does not build anything
-# itself (see scripts/install_ep_kernels.sh, scripts/install_deep_gemm.sh,
-# scripts/build_torchao.sh for the pinned revs).
+# all five — prime-rl only consumes the resulting release, it does not build anything
+# itself (see scripts/install_ep_kernels.sh, scripts/install_deep_ep_v2.sh,
+# scripts/install_deep_gemm.sh, scripts/build_torchao.sh for the pinned revs).
 #
 # Matrix: {kernel} x {arch: x86_64, aarch64}, all built against CUDA 13.0 (matches the
 # driver on our Blackwell fleet; see CUDA_TAG below). TORCH_CUDA_ARCH_LIST is set
@@ -41,6 +41,7 @@ on:
       - "prime_kernels/**"
       - "scripts/install_ep_kernels.sh"
       - "scripts/install_deep_gemm.sh"
+      - "scripts/install_deep_ep_v2.sh"
       - "scripts/build_torchao.sh"
       - "scripts/smoke_test.py"
       - "pyproject.toml"
@@ -50,6 +51,7 @@ on:
       - "prime_kernels/**"
       - "scripts/install_ep_kernels.sh"
       - "scripts/install_deep_gemm.sh"
+      - "scripts/install_deep_ep_v2.sh"
       - "scripts/build_torchao.sh"
       - "scripts/smoke_test.py"
       - "pyproject.toml"
@@ -80,7 +82,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        kernel: [prime-kernels, deep-ep, deep-gemm, torchao]
+        kernel: [prime-kernels, deep-ep, deep-ep-v2, deep-gemm, torchao]
         arch: [x86_64, aarch64]
         include:
           # PyTorch publishes separate manylinux builder images per arch, not a
@@ -101,8 +103,10 @@ jobs:
       # /opt/conda and gcc-toolset-13). libibverbs-devel/librdmacm-devel: NVSHMEM's
       # IBGDA transport headers (infiniband/mlx5dv.h), compile-time only — deep-ep
       # dlopens the real thing at runtime. `xz` unpacks the NVSHMEM archive.
+      # elfutils-devel: DeepJIT's elfutils/libdwfl.h (deep-ep-v2; libdw is dlopened at
+      # runtime too).
       - name: Install build tooling
-        run: dnf install -y --setopt=install_weak_deps=False ca-certificates xz libibverbs-devel librdmacm-devel
+        run: dnf install -y --setopt=install_weak_deps=False ca-certificates xz libibverbs-devel librdmacm-devel elfutils-devel
 
       - name: Checkout
         uses: actions/checkout@v5
@@ -151,6 +155,18 @@ jobs:
         run: |
           export PATH="/tmp/build-env/bin:$PATH"
           bash scripts/install_ep_kernels.sh --workspace /tmp/ep_kernels_workspace --wheel-dir "$PWD/dist"
+
+      # No TORCH_CUDA_ARCH_LIST: the extension is host code only, DeepJIT compiles the
+      # kernels for the local GPU at runtime.
+      - name: Build deep-ep-v2 wheel
+        if: matrix.kernel == 'deep-ep-v2'
+        env:
+          VIRTUAL_ENV: /tmp/build-env
+          CUDA_HOME: /usr/local/cuda
+          MAX_JOBS: "8"
+        run: |
+          export PATH="/tmp/build-env/bin:$PATH"
+          bash scripts/install_deep_ep_v2.sh --wheel-dir dist
 
       - name: Build deep-gemm wheel
         if: matrix.kernel == 'deep-gemm'
@@ -205,7 +221,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        kernel: [prime-kernels, deep-ep, deep-gemm, torchao]
+        kernel: [prime-kernels, deep-ep, deep-ep-v2, deep-gemm, torchao]
     runs-on: vm
     # `env` isn't available in `container:` (GitHub Actions only exposes it inside
     # steps), so this has to be a literal — keep it in sync with CONTAINER_IMAGE above.
@@ -238,6 +254,10 @@ jobs:
           uv venv --python 3.12 /tmp/test-env
           VIRTUAL_ENV=/tmp/test-env uv pip install "torch==${{ env.TORCH_VERSION }}"
           VIRTUAL_ENV=/tmp/test-env uv pip install dist/*.whl
+          # deep-ep-v2 needs a newer NCCL than torch pins (see install_deep_ep_v2.sh).
+          if [ "${{ matrix.kernel }}" = deep-ep-v2 ]; then
+            VIRTUAL_ENV=/tmp/test-env uv pip install "nvidia-nccl-cu13==2.32.3"
+          fi
 
       - name: Run smoke test
         run: /tmp/test-env/bin/python scripts/smoke_test.py ${{ matrix.kernel }}
