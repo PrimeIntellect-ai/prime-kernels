@@ -58,13 +58,18 @@ SHORT_REF=$(git rev-parse --short=7 HEAD)
 uv pip install "nvidia-nccl-cu13==${NCCL_VER}"
 
 # Rename the Python package. setup.py would otherwise version the dirty tree `+local`.
+# The host extension also moves to the C++ namespace deep_ep_v2: pybind11 registers
+# types by C++ type, so with V1's deep_ep::EventHandle etc. already registered,
+# importing both packages fails. The macro leaves `#include <deep_ep/...>` and the JIT's
+# kernel source strings alone.
 mv deep_ep deep_ep_v2
 grep -rlZ 'deep_ep\._C' deep_ep_v2 --include='*.py' | xargs -0 sed -i 's/\bdeep_ep\._C\b/deep_ep_v2._C/g'
 sed -i -e "s|'deep_ep|'deep_ep_v2|g" \
        -e "s|/deep_ep/include|/deep_ep_v2/include|" \
        -e "s|name='deep_ep_v2'|name='deep-ep-v2'|" \
-       -e "s|revision = '+local'|revision = '+${SHORT_REF}'|" setup.py
-if grep -nE "'deep_ep['.]|/deep_ep/include" setup.py; then
+       -e "s|revision = '+local'|revision = '+${SHORT_REF}'|" \
+       -e "s|cxx_flags = \['-std=c++20',|cxx_flags = ['-std=c++20', '-Ddeep_ep=deep_ep_v2',|" setup.py
+if grep -nE "'deep_ep['.]|/deep_ep/include" setup.py || ! grep -q "'-Ddeep_ep=deep_ep_v2'" setup.py; then
     echo "ERROR: setup.py still references the deep_ep package" >&2; exit 1
 fi
 if grep -rn '\bdeep_ep\._C\b\|^ *\(import\|from\) deep_ep\b' deep_ep_v2 --include='*.py'; then
