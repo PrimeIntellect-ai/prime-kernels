@@ -71,6 +71,15 @@ if grep -rn '\bdeep_ep\._C\b\|^ *\(import\|from\) deep_ep\b' deep_ep_v2 --includ
     echo "ERROR: deep_ep_v2 still imports deep_ep" >&2; exit 1
 fi
 
+# The build image's glibc headers predate pidfd_open/pidfd_getfd (same numbers on x86_64 and aarch64).
+sed -i '\|#include <sys/syscall.h>|a\
+#ifndef SYS_pidfd_open\
+#define SYS_pidfd_open 434\
+#endif\
+#ifndef SYS_pidfd_getfd\
+#define SYS_pidfd_getfd 438\
+#endif' csrc/kernels/comm/symmetric.hpp
+
 # setup.py hard-codes /usr/local/cuda/include/cccl.
 export CUDA_HOME
 export CPATH="$CUDA_HOME/include/cccl${CPATH:+:$CPATH}"
