@@ -8,7 +8,7 @@ prime-rl's tests/unit/train/models/test_fused_moe.py for flash_moe); this only
 guards the thing cross-compilation can't verify on its own: does the compiled
 extension actually load and run on this GPU.
 
-Usage: python smoke_test.py <prime-kernels|deep-ep|deep-gemm|torchao>
+Usage: python smoke_test.py <prime-kernels|deep-ep|deep-gemm|torchao|flash-attn>
 """
 
 import sys
@@ -71,11 +71,25 @@ def smoke_torchao():
     print("MXTensor.to_mx OK:", mx.qdata.shape, mx.qdata.dtype)
 
 
+def smoke_flash_attn():
+    from flash_attn import __version__, flash_attn_func
+
+    print("flash_attn", __version__)
+    b, s, h, d = 2, 128, 8, 64
+    q = torch.randn(b, s, h, d, device="cuda", dtype=torch.bfloat16)
+    k = torch.randn(b, s, h, d, device="cuda", dtype=torch.bfloat16)
+    v = torch.randn(b, s, h, d, device="cuda", dtype=torch.bfloat16)
+    out = flash_attn_func(q, k, v, causal=True)
+    assert out.shape == q.shape, out.shape
+    assert torch.isfinite(out).all(), "flash_attn output contains non-finite values"
+
+
 CHECKS = {
     "prime-kernels": smoke_prime_kernels,
     "deep-gemm": smoke_deep_gemm,
     "deep-ep": smoke_deep_ep,
     "torchao": smoke_torchao,
+    "flash-attn": smoke_flash_attn,
 }
 
 
