@@ -14,6 +14,7 @@ CUDA kernels for Prime Intellect training stacks, shipped as one wheel, `prime-k
     │   ├── mxfp8.py
     │   └── csrc/             # the C++/CUDA sources compiled into prime_kernels.flash_moe._C
     ├── indexed_attention/    # Python-only TileLang indexed GQA forward + backward
+    ├── dsa_indexer_topk/     # Python-only Triton DeepSeek-V4.1 Lightning Indexer + top-k
     └── rmsnorm/
         ├── __init__.py
         ├── csrc/             # the torch binding
@@ -63,6 +64,54 @@ as well as attention, and accept different query and KV lengths so the caller ca
 for context parallelism without gathering queries.
 It supports SM80, SM90, SM100, and SM103 (B300), and requires TileLang (validated with
 0.1.12). Install TileLang separately; the registry reports it missing when unavailable.
+
+`dsa_indexer_topk` is DeepSeek-V4.1's Lightning Indexer forward fused with its top-k, including
+the two-level candidate-block filter, as a drop-in for prime-rl's `dsv41_index_topk` (same
+arguments, same picks up to ties). It never materializes the `(queries, entries)` score matrix:
+a dense FP8 GEMM keeps only per-group score maxima, the best groups are selected per query, and
+only their entries are rescored and ranked; candidate consumer layers score only their candidate
+entries. Forward only (the indexer is frozen). Triton, validated on SM90 (H200).
+
+`moe_experts` is the expert MLP of a rank's local experts for training on Hopper (SM90):
+`down(silu(min(gate, l)) * clamp(up, -l, l))` over tokens already grouped by expert, the
+DeepSeek-V4 clamped SwiGLU, bf16, differentiable in the tokens and all three weights. It is
+the Hopper counterpart of the expert compute inside cuDNN's MegaMoE (which also fuses the
+cross-GPU dispatch and is Blackwell only); dispatch and routing scores stay with the caller.
+Its grouped GEMMs are persistent, warp-specialized Gluon kernels whose epilogue warpgroup
+applies the SwiGLU (forward) or its derivative (backward, also recomputing the activation)
+while the tensor cores run the next tile, so only `x`, `gate` and `up` are saved for backward.
+The weight gradients use `torch._grouped_mm`. Group sizes must be multiples of
+`moe_experts.TOKEN_GROUP_ALIGNMENT`; `tests/moe_experts/bench_moe_experts.py` compares it with
+`torch._grouped_mm` plus an unfused activation.
+
+`moe_experts(..., fp8=True)` runs the same MLP in blockwise FP8 (DeepSeek-V3 recipe: e4m3, 1 x 128
+scales for activations and gradients along each GEMM's K, 128 x 128 for weights, fp32
+accumulation) for the forward, the data gradients and the weight gradients. The GEMMs are
+DeepGEMM's grouped FP8 GEMMs (DeepGEMM must be installed); everything around them is fused into a
+few Triton/Gluon passes: one read of `x` (and of the output gradient) writes both its row- and
+column-quantized copies, the SwiGLU passes quantize their outputs, and DeepGEMM writes the outputs
+in place at the tokens' rows. Hidden and intermediate sizes must be multiples of 128.
+
+`dsa_sparse_attn_bwd` is the backward of DeepSeek-V4.1's sparse attention on Hopper (SM90):
+every query reads its own list of rows of one shared K = V latent buffer (`-1` = empty slot), with
+a per-head attention sink, 64 heads of 512. It is a drop-in for prime-rl's
+`dsv41_sparse_attn_backward` (same inputs, including FlashMLA's sink-free LSE; returns dq, dkv,
+dsinks) as the custom op `prime_kernels::dsa_sparse_attn_bwd` (with a fake impl), and
+`sparse_attn_backward_flat` takes the unbatched layout of cuDNN's `flash_attn_bwd_sm90`. A Triton
+pass computes delta = rowsum(dO * O), the sink-aware LSE and dsinks and compacts each query's
+non-empty slots to the front; the main kernel (CuTe DSL) is a persistent, two-warpgroup kernel
+with one query per iteration: S / dP / softmax / dQ in registers over tiles of 64 gathered latent
+rows, and dKV added with fp32 vector atomics into a buffer that a last Triton pass casts to bf16.
+The atomics (2 KB per query-slot) bound it; at V4.1 shapes it is ~1.2x faster than cuDNN's SM90
+backward (`tests/dsa_sparse_attn_bwd/bench_dsa_sparse_attn_bwd.py`).
+
+`mhc_projection` is DeepSeek-V4.1's manifold-constrained hyper-connection (mHC) projection for
+SM90, forward and backward, in Triton: one pass over the `(tokens, hc_mult, hidden)` streams
+computes the RMS statistic, the projection to the `(2 + hc_mult) * hc_mult` gate logits and the
+collapse of the streams by the previous sublayer's `pre` gate; a second kernel applies the gate
+activations (sigmoid `pre`/`post`, Sinkhorn `comb`). `hyper_connection` chains both, with
+`torch.library` custom ops (and fake impls) so it can sit inside `torch.compile`d blocks.
+`tests/mhc_projection/bench_mhc_projection.py` compares it against prime-rl's path.
 
 ## Installing
 
