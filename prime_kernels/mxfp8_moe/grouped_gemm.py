@@ -188,6 +188,9 @@ class _GroupedGemm(torch.autograd.Function):
     @staticmethod
     def backward(ctx, grad_output: torch.Tensor):
         input_act, weight_t, offsets = ctx.saved_tensors
+        # torchao's MXFP8 casts require contiguous input, but autograd may pass a non-contiguous gradient
+        # (e.g. the stride-0 expansion from `out.sum().backward()`).
+        grad_output = grad_output.contiguous()
         grad_input = _dgrad(grad_output, weight_t, offsets) if ctx.needs_input_grad[0] else None
         grad_weight = (
             _wgrad(
