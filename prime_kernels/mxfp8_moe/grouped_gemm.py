@@ -165,6 +165,10 @@ def _wgrad(
         offs=offsets,
         out_dtype=torch.bfloat16,
     )
+    # `_scaled_grouped_mm` leaves an empty group's output unwritten, unlike `_grouped_mm`, so an
+    # expert that received no tokens would get uninitialized memory instead of a zero gradient.
+    empty_groups = torch.diff(offsets, prepend=offsets.new_zeros(1)) == 0
+    grad_weight = torch.where(empty_groups[:, None, None], 0.0, grad_weight)
     return grad_weight.transpose(-2, -1)
 
 
