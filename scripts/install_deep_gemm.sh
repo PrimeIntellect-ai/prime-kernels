@@ -10,20 +10,25 @@
 #   bash scripts/install_deep_gemm.sh --wheel-dir dist
 #
 # Options:
-#   --ref REF        DeepGEMM commit hash (default: 891d57b)
+#   --repo URL       DeepGEMM git repository (default: vllm-project/DeepGEMM)
+#   --ref REF        DeepGEMM commit hash (default: e1f418c)
 #   --wheel-dir DIR  Output wheel to DIR (default: ./dist)
+#
+# The default is vLLM's DeepGEMM fork at the commit vLLM 0.31.0 vendors (2.8.0). vLLM imports
+# an installed `deep_gemm` ahead of its vendored copy, so this keeps both on the same kernels.
 
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(dirname "$SCRIPT_DIR")"
 
-DEEPGEMM_GIT_REPO="https://github.com/deepseek-ai/DeepGEMM.git"
-DEEPGEMM_GIT_REF="891d57b4db1071624b5c8fa0d1e51cb317fa709f"
+DEEPGEMM_GIT_REPO="https://github.com/vllm-project/DeepGEMM.git"
+DEEPGEMM_GIT_REF="e1f418c2a4f20818221f6b0e578b4c2f634d4c3f"
 WHEEL_DIR="$REPO_ROOT/dist"
 
 while [[ $# -gt 0 ]]; do
     case $1 in
+        --repo)      DEEPGEMM_GIT_REPO="$2"; shift 2 ;;
         --ref)       DEEPGEMM_GIT_REF="$2"; shift 2 ;;
         --wheel-dir) WHEEL_DIR="$2";        shift 2 ;;
         *) echo "Unknown argument: $1" >&2; exit 1 ;;
