@@ -212,7 +212,7 @@ def grouped_gemm(
     *,
     high_precision_wgrad: bool = False,
 ) -> torch.Tensor:
-    """Run differentiable MXFP8 grouped GEMM on already aligned token groups."""
+    """Run differentiable MXFP8 grouped GEMM on token groups; every group size must be a multiple of `TOKEN_GROUP_ALIGNMENT`, or the weight gradient is silently wrong."""
     if input_act.ndim != 2 or weight_t.ndim != 3:
         raise ValueError(
             f"MXFP8 grouped GEMM expects 2D activations and 3D weights, got {input_act.ndim}D and {weight_t.ndim}D"
