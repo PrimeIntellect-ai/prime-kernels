@@ -8,7 +8,7 @@ prime-rl's tests/unit/train/models/test_fused_moe.py for flash_moe); this only
 guards the thing cross-compilation can't verify on its own: does the compiled
 extension actually load and run on this GPU.
 
-Usage: python smoke_test.py <prime-kernels|deep-ep|deep-gemm|torchao>
+Usage: python smoke_test.py <prime-kernels|deep-ep|deep-gemm|deep-select|torchao>
 """
 
 import sys
@@ -49,6 +49,19 @@ def smoke_deep_gemm():
     assert err < 1.0, f"deep_gemm output diverges: max err {err}"
 
 
+def smoke_deep_select():
+    import deep_select
+
+    print("deep_select", deep_select.__file__)
+    if CAP not in ((9, 0), (10, 0), (10, 3)):
+        print(f"deep_select is built for sm_90a/sm_100a/sm_103a; skipping on {CAP_STR}")
+        return
+    x = torch.randn(64, 32768, device="cuda")
+    _, idx = deep_select.topk(x, 2048, indices_type=torch.int64, return_value=False)
+    ref = torch.topk(x, 2048, dim=-1).indices
+    assert torch.equal(idx.sort(dim=-1).values, ref.sort(dim=-1).values), "deep_select picks differ from torch.topk"
+
+
 def smoke_deep_ep():
     import deep_ep
 
@@ -75,6 +88,7 @@ CHECKS = {
     "prime-kernels": smoke_prime_kernels,
     "deep-gemm": smoke_deep_gemm,
     "deep-ep": smoke_deep_ep,
+    "deep-select": smoke_deep_select,
     "torchao": smoke_torchao,
 }
 
