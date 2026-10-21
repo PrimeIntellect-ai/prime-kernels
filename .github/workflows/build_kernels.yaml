@@ -2,7 +2,7 @@ name: Build and Release Kernels
 
 # Builds every wheel prime-rl (and other consumers) pin via `[tool.uv.sources]`:
 # prime-kernels (this repo's own kernels.toml-declared extensions), deep-ep and
-# deep-gemm (from their pinned deepseek-ai revs), and our torchao (from the pytorch/ao
+# deep-gemm (from their pinned upstream revs), and our torchao (from the pytorch/ao
 # rev the MXFP8 training path requires). This repo is the single build+release site for
 # all four — prime-rl only consumes the resulting release, it does not build anything
 # itself (see scripts/install_ep_kernels.sh, scripts/install_deep_gemm.sh,
@@ -100,9 +100,11 @@ jobs:
       # git, curl, gcc/g++/make and cmake/ninja already ship in this image (via
       # /opt/conda and gcc-toolset-13). libibverbs-devel/librdmacm-devel: NVSHMEM's
       # IBGDA transport headers (infiniband/mlx5dv.h), compile-time only — deep-ep
-      # dlopens the real thing at runtime. `xz` unpacks the NVSHMEM archive.
+      # dlopens the real thing at runtime. elfutils-devel: DeepJIT's `elfutils/libdwfl.h`
+      # (deep-gemm's stack traces), also compile-time only and dlopened at runtime. `xz`
+      # unpacks the NVSHMEM archive.
       - name: Install build tooling
-        run: dnf install -y --setopt=install_weak_deps=False ca-certificates xz libibverbs-devel librdmacm-devel
+        run: dnf install -y --setopt=install_weak_deps=False ca-certificates xz libibverbs-devel librdmacm-devel elfutils-devel
 
       - name: Checkout
         uses: actions/checkout@v5
