@@ -6,7 +6,7 @@ import triton.language as tl
 MAX_WINDOW_QUERIES = 8
 MMA_ROWS = 64
 BLOCK_KEYS = 32
-SORT_CHUNK_WINDOWS = 4096
+SORT_CHUNK_WINDOWS = 1024
 _EMPTY = tl.constexpr(0x7FFFFFFF)
 
 
