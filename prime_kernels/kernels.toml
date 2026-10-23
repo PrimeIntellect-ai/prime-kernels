@@ -33,7 +33,7 @@ arch = ["10.0", "10.3"]
 [indexed_attention]
 description = "Training forward and backward for token-indexed grouped-query attention"
 python-only = true
-requires = ["tilelang"]
+requires = ["tilelang", "triton"]
 arch = ["8.0", "9.0", "10.0", "10.3"]
 
 # rmsnorm is not built yet: only its sources are committed. Uncomment the table below to
