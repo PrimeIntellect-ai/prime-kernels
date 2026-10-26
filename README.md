@@ -58,11 +58,13 @@ grouped GEMM and MXFP8 expert-parallel transport. It is registered as Python-onl
 it orchestrates PyTorch and torchao kernels rather than compiling a `_C` extension here.
 
 `indexed_attention` provides differentiable grouped-query attention over an explicit token
-selection for each query. Its TileLang kernels compute selection scores and radix selection
-as well as attention, and accept different query and KV lengths so the caller can gather KV
-for context parallelism without gathering queries.
+selection for each query. Its TileLang kernels compute selection scores and radix selection.
+Its Triton attention kernels put the heads of several consecutive queries of one KV group into
+the 64 MMA rows and run over the union of their selections; the backward computes dK/dV per key
+tile without atomics, so it is deterministic. They accept different query and KV lengths so the
+caller can gather KV for context parallelism without gathering queries.
 It supports SM80, SM90, SM100, and SM103 (B300), and requires TileLang (validated with
-0.1.12). Install TileLang separately; the registry reports it missing when unavailable.
+0.1.12) and Triton. Install TileLang separately; the registry reports it missing when unavailable.
 
 ## Installing
 
