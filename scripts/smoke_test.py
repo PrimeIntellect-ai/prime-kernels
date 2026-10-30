@@ -34,6 +34,24 @@ def smoke_prime_kernels():
     flash_moe = prime_kernels.load("flash_moe")
     print("flash_moe loaded:", flash_moe)
 
+    if "torchao" in status.get("mxfp8_moe", ""):
+        print("mxfp8_moe needs torchao, which this environment lacks; skipping its check")
+        return
+    assert status.get("mxfp8_moe") == "available", status
+    mxfp8_moe = prime_kernels.load("mxfp8_moe")
+    # 48 groups take the Triton scale rearrange with power-of-two padding; empty groups at the start,
+    # middle and end must get zero weight gradients, so unwritten memory is made NaN first.
+    counts = torch.full((48,), 32, device="cuda")
+    counts[[0, 23, 47]] = 0
+    offsets = torch.cumsum(counts, 0, dtype=torch.int32)
+    x = torch.randn(int(counts.sum()), 64, device="cuda", dtype=torch.bfloat16, requires_grad=True)
+    weight = torch.randn(48, 128, 64, device="cuda", dtype=torch.bfloat16, requires_grad=True)
+    torch.full((64 << 20,), float("nan"), device="cuda")
+    mxfp8_moe.grouped_gemm(x, weight.transpose(-2, -1), offsets).sum().backward()
+    assert torch.isfinite(x.grad).all() and torch.isfinite(weight.grad[counts > 0]).all()
+    assert torch.all(weight.grad[counts == 0] == 0), "experts with no tokens must get a zero gradient"
+    print("mxfp8_moe grouped_gemm forward + backward ran")
+
 
 def smoke_deep_gemm():
     import deep_gemm

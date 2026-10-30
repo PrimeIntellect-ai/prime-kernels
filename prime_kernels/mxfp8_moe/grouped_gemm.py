@@ -165,6 +165,10 @@ def _wgrad(
         offs=offsets,
         out_dtype=torch.bfloat16,
     )
+    # `_scaled_grouped_mm` leaves an empty group's output unwritten, unlike `_grouped_mm`, so an
+    # expert that received no tokens would get uninitialized memory instead of a zero gradient.
+    empty_groups = torch.diff(offsets, prepend=offsets.new_zeros(1)) == 0
+    grad_weight = torch.where(empty_groups[:, None, None], 0.0, grad_weight)
     return grad_weight.transpose(-2, -1)
 
 
@@ -184,6 +188,9 @@ class _GroupedGemm(torch.autograd.Function):
     @staticmethod
     def backward(ctx, grad_output: torch.Tensor):
         input_act, weight_t, offsets = ctx.saved_tensors
+        # torchao's MXFP8 casts require contiguous input, but autograd may pass a non-contiguous gradient
+        # (e.g. the stride-0 expansion from `out.sum().backward()`).
+        grad_output = grad_output.contiguous()
         grad_input = _dgrad(grad_output, weight_t, offsets) if ctx.needs_input_grad[0] else None
         grad_weight = (
             _wgrad(
@@ -205,7 +212,7 @@ def grouped_gemm(
     *,
     high_precision_wgrad: bool = False,
 ) -> torch.Tensor:
-    """Run differentiable MXFP8 grouped GEMM on already aligned token groups."""
+    """Run differentiable MXFP8 grouped GEMM on token groups; every group size must be a multiple of `TOKEN_GROUP_ALIGNMENT`, or the weight gradient is silently wrong."""
     if input_act.ndim != 2 or weight_t.ndim != 3:
         raise ValueError(
             f"MXFP8 grouped GEMM expects 2D activations and 3D weights, got {input_act.ndim}D and {weight_t.ndim}D"
