@@ -51,6 +51,10 @@ git clone --recurse-submodules "$DEEPGEMM_GIT_REPO" "$TMPDIR/DeepGEMM"
 cd "$TMPDIR/DeepGEMM"
 git checkout "$DEEPGEMM_GIT_REF"
 git submodule update --init --recursive
+# torch >= 2.14 headers require C++20 (ATen.h errors out below it); this DeepGEMM rev still
+# builds its extension as C++17. vLLM's DeepGEMM fork made the same switch.
+sed -i "s/'-std=c++17'/'-std=c++20'/" setup.py
+grep -q "'-std=c++20'" setup.py || { echo "ERROR: could not switch DeepGEMM to C++20" >&2; exit 1; }
 
 # Back to the invocation directory: a relative --wheel-dir must resolve there, not
 # inside $TMPDIR, which the EXIT trap deletes before the caller ever sees the wheel.
