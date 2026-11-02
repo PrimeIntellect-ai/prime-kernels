@@ -74,7 +74,7 @@ env:
   # — see Dockerfile.cuda in prime-rl), deliberately different from `build`'s (see the
   # portability comment up top and the per-arch images in the `build` matrix below).
   CONTAINER_IMAGE: nvidia/cuda:13.0.3-devel-ubuntu24.04
-  TORCH_VERSION: 2.13.0+cu130
+  TORCH_VERSION: 2.14.0+cu130
 
 jobs:
   build:
