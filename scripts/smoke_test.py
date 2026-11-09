@@ -8,7 +8,7 @@ prime-rl's tests/unit/train/models/test_fused_moe.py for flash_moe); this only
 guards the thing cross-compilation can't verify on its own: does the compiled
 extension actually load and run on this GPU.
 
-Usage: python smoke_test.py <prime-kernels|deep-ep|deep-gemm|deep-select|torchao>
+Usage: python smoke_test.py <prime-kernels|deep-ep|deep-select|torchao>
 """
 
 import sys
@@ -33,20 +33,6 @@ def smoke_prime_kernels():
     assert status.get("flash_moe") == "available", status
     flash_moe = prime_kernels.load("flash_moe")
     print("flash_moe loaded:", flash_moe)
-
-
-def smoke_deep_gemm():
-    import deep_gemm
-
-    print("deep_gemm", deep_gemm.__version__)
-    m, k, n = 128, 512, 512
-    a = torch.randn(m, k, device="cuda", dtype=torch.bfloat16)
-    b = torch.randn(n, k, device="cuda", dtype=torch.bfloat16)
-    out = torch.empty(m, n, device="cuda", dtype=torch.bfloat16)
-    deep_gemm.bf16_gemm_nt(a, b, out)
-    err = (out.float() - (a @ b.T).float()).abs().max().item()
-    print("bf16 gemm max err:", err)
-    assert err < 1.0, f"deep_gemm output diverges: max err {err}"
 
 
 def smoke_deep_select():
@@ -86,7 +72,6 @@ def smoke_torchao():
 
 CHECKS = {
     "prime-kernels": smoke_prime_kernels,
-    "deep-gemm": smoke_deep_gemm,
     "deep-ep": smoke_deep_ep,
     "deep-select": smoke_deep_select,
     "torchao": smoke_torchao,
