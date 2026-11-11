@@ -52,8 +52,8 @@ sources = [
 ]
 include-dirs = ["csrc/grouped_gemm"]
 include-packages = { cutlass_library = ["source/include", "source/tools/util/include"] }
-arch = ["10.0a"]
-cxx-std = 17
+arch = ["10.0a", "10.3a"]
+cxx-std = 20
 cxx-flags = ["-O3"]
 nvcc-flags = ["-O3", "--expt-relaxed-constexpr", "--expt-extended-lambda", "--threads=2"]
 
