@@ -12,7 +12,7 @@ from .quantize import (
     quantize_weights,
 )
 
-NVFP4Backward = Literal["dequant_bf16", "bf16"]
+NVFP4Backward = Literal["mxfp8", "dequant_bf16", "bf16"]
 
 
 class _GroupedNVFP4MM(torch.autograd.Function):
@@ -37,7 +37,7 @@ class _GroupedNVFP4MM(torch.autograd.Function):
             weight_nvfp4.global_scales,
         )
         ctx.backward_mode = backward
-        if backward == "bf16":
+        if backward in ("bf16", "mxfp8"):
             ctx.save_for_backward(matrix, weight, offsets)
         else:
             ctx.save_for_backward(
@@ -54,6 +54,17 @@ class _GroupedNVFP4MM(torch.autograd.Function):
     @staticmethod
     def backward(ctx, grad_output: torch.Tensor):
         grad_output = grad_output.contiguous().bfloat16()
+        if ctx.backward_mode == "mxfp8":
+            # MXFP8 gradient GEMMs on the original BF16 operands (E4M3 values, E8M0 scales per 32 elements): the
+            # backward never meets the sampler, so it trades exactness for speed
+            from prime_kernels.mxfp8_moe.grouped_gemm import _dgrad, _wgrad
+
+            matrix, weight, offsets = ctx.saved_tensors
+            grad_matrix = _dgrad(grad_output, weight, offsets) if ctx.needs_input_grad[0] else None
+            grad_weight = (
+                _wgrad(grad_output, matrix, offsets, high_precision=False) if ctx.needs_input_grad[1] else None
+            )
+            return grad_matrix, grad_weight, None, None, None
         if ctx.backward_mode == "bf16":
             matrix, weight, offsets = ctx.saved_tensors
         else:
@@ -107,16 +118,18 @@ def grouped_gemm(
     backward: NVFP4Backward = "dequant_bf16",
     four_over_six: bool = False,
 ) -> torch.Tensor:
-    """Grouped NVFP4 forward with the selected BF16 backward operands.
+    """Grouped NVFP4 forward with the selected backward.
 
     ``matrix`` has shape ``[M, K]``, ``weight`` has shape ``[G, K, N]``, and
     ``offs`` contains the cumulative row count for each of the ``G`` groups.
-    ``dequant_bf16`` reconstructs both operands from the packed forward tensors;
-    ``bf16`` retains the original BF16 operands.
+    ``mxfp8`` runs both gradient GEMMs in MXFP8 on the original BF16 operands
+    (needs ``mxfp8_moe``'s torchao kernels); ``dequant_bf16`` runs them in BF16
+    on operands reconstructed from the packed forward tensors; ``bf16`` runs
+    them in BF16 on the original operands.
     ``four_over_six`` enables FlashInfer's default 448-bound, MAE 4/6 recipe.
     """
 
-    if backward not in ("dequant_bf16", "bf16"):
+    if backward not in ("mxfp8", "dequant_bf16", "bf16"):
         raise ValueError(f"unsupported NVFP4 backward mode: {backward}")
     if matrix.ndim != 2 or weight.ndim != 3:
         raise ValueError("matrix must be 2D and weight must be 3D")

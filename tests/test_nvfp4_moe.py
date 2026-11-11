@@ -66,6 +66,15 @@ def test_nvfp4_forward_and_backward_operands(kernel, k, n, four_over_six):
         torch.testing.assert_close(x.grad, expected_dx, rtol=0, atol=0)
         torch.testing.assert_close(w.grad, expected_dw, rtol=0, atol=0)
 
+    # MXFP8 gradient GEMMs approximate the BF16 gradients on the original operands
+    x.grad = w.grad = None
+    kernel.grouped_gemm(x, w, offs=offsets, backward="mxfp8", four_over_six=four_over_six).backward(grad)
+    expected_dx = F.grouped_mm(grad, w.transpose(-1, -2), offs=offsets, out_dtype=torch.bfloat16)
+    expected_dw = F.grouped_mm(x.T, grad, offs=offsets, out_dtype=torch.bfloat16)
+    for actual, expected in ((x.grad, expected_dx), (w.grad, expected_dw)):
+        error = ((actual.float() - expected.float()).square().mean() / expected.float().square().mean()).sqrt()
+        assert error < 0.05, error.item()
+
 
 @pytest.mark.parametrize("four_over_six", [False, True])
 def test_nvfp4_token_locality_and_zero_rows(kernel, four_over_six):
