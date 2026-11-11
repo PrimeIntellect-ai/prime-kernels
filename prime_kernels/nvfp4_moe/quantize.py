@@ -60,10 +60,17 @@ def _check_bf16_cuda(tensor: torch.Tensor, name: str) -> None:
 
 
 def quantize_activations(
-    matrix: torch.Tensor, offsets: torch.Tensor, *, four_over_six: bool = False, exact_division: bool = False
+    matrix: torch.Tensor,
+    offsets: torch.Tensor,
+    *,
+    four_over_six: bool = False,
+    exact_division: bool = False,
+    static_scale: bool = False,
 ) -> _NVFP4Tensor:
     """Quantize ``[M, K]`` activations with one FP32 decode scale per token. ``exact_division`` uses IEEE-rounded
-    reciprocals in the block math instead of FlashInfer's approximate ones (what vLLM's NVFP4 engines use)."""
+    reciprocals in the block math instead of FlashInfer's approximate ones (what vLLM's NVFP4 engines use).
+    ``static_scale`` fixes every token's global decode scale at 1.0 instead of its amax / 2688: how vLLM's online NVFP4
+    engines (TRTLLM) quantize the down projection's input."""
 
     _check_blackwell()
     if matrix.ndim != 2:
@@ -83,6 +90,7 @@ def quantize_activations(
         offsets,
         four_over_six,
         exact_division,
+        static_scale,
     )
     return _NVFP4Tensor(
         data=packed.view(torch.float4_e2m1fn_x2),

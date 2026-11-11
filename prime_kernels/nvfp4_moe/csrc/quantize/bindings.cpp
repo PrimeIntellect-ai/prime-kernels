@@ -10,7 +10,8 @@ quantize_activations_cuda(
     const at::Tensor& matrix,
     const at::Tensor& offsets,
     bool four_over_six,
-    bool exact_division);
+    bool exact_division,
+    bool static_scale);
 
 std::tuple<at::Tensor, at::Tensor, at::Tensor>
 quantize_weights_cuda(const at::Tensor& weight_rows, bool four_over_six, bool exact_division);
@@ -29,7 +30,7 @@ at::Tensor dequantize_weights_cuda(
 TORCH_LIBRARY_FRAGMENT(prime_rl, m) {
   m.def(
       "quantize_nvfp4_activations(Tensor matrix, Tensor offsets, bool four_over_six=False, "
-      "bool exact_division=False) -> "
+      "bool exact_division=False, bool static_scale=False) -> "
       "(Tensor, Tensor, Tensor)");
   m.def(
       "quantize_nvfp4_weights(Tensor weight_rows, bool four_over_six=False, bool exact_division=False) -> "

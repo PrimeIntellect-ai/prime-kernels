@@ -301,7 +301,9 @@ __device__ __forceinline__ float four_over_six_error(
   return error;
 }
 
-template <bool PerToken, bool Exact>
+// PerToken: the stored decode scale is the row's amax / 2688 (scored against the row amax). Given: the stored decode
+// scale is fixed by the caller (static input scale, as vLLM's online NVFP4 uses for the down-projection input).
+template <bool PerToken, bool Exact, bool Given = false>
 __device__ __forceinline__ uint8_t quantize_block_four_over_six(
     const Bf16Block& input,
     float global_amax,
@@ -312,7 +314,7 @@ __device__ __forceinline__ uint8_t quantize_block_four_over_six(
     *packed = 0;
     return 0;
   }
-  const float encode_scale = PerToken
+  const float encode_scale = (PerToken || Given)
       ? reciprocal<Exact>(stored_decode_scale)
       : __fdiv_rn(kGlobalScaleDenominator, fmaxf(global_amax, 1e-8f));
   const float decode_scale = reciprocal<Exact>(encode_scale);
@@ -326,9 +328,9 @@ __device__ __forceinline__ uint8_t quantize_block_four_over_six(
       input, reciprocal<Exact>(__fmul_rn(sf6, decode_scale)));
   const uint64_t packed4 = pack_e2m1(
       input, reciprocal<Exact>(__fmul_rn(sf4, decode_scale)));
-  const float error6 = four_over_six_error<PerToken>(
+  const float error6 = four_over_six_error<PerToken && !Given>(
       input, packed6, sf6, decode_scale, global_amax);
-  const float error4 = four_over_six_error<PerToken>(
+  const float error4 = four_over_six_error<PerToken && !Given>(
       input, packed4, sf4, decode_scale, global_amax);
   const bool use_four = error4 < error6;
   *packed = use_four ? packed4 : packed6;
@@ -445,7 +447,7 @@ __global__ void finalize_weight_scales_kernel(
   }
 }
 
-template <bool FourOverSix, bool Exact>
+template <bool FourOverSix, bool Exact, bool Static>
 __global__ void quantize_activations_tiled_kernel(
     const __nv_bfloat16* __restrict__ input,
     const int32_t* __restrict__ offsets,
@@ -490,9 +492,9 @@ __global__ void quantize_activations_tiled_kernel(
           scale_column * kSfVectorSize;
       uint64_t packed_value;
       if constexpr (FourOverSix) {
-        scale = quantize_block_four_over_six<true, Exact>(
+        scale = quantize_block_four_over_six<!Static, Exact, Static>(
             load_bf16_block(input + input_offset),
-            row_amax[row],
+            Static ? 0.0f : row_amax[row],
             global_scales[row],
             &packed_value);
       } else {
@@ -803,7 +805,8 @@ quantize_activations_cuda(
     const at::Tensor& matrix,
     const at::Tensor& offsets,
     bool four_over_six,
-    bool exact_division) {
+    bool exact_division,
+    bool static_scale) {
   check_bf16_matrix(matrix, "matrix");
   TORCH_CHECK(matrix.dim() == 2, "matrix must be 2D.");
   TORCH_CHECK(
@@ -845,7 +848,7 @@ quantize_activations_cuda(
       matrix.options().dtype(at::kFloat8_e4m3fn));
   auto global_scales =
       at::empty({rows}, matrix.options().dtype(at::kFloat));
-  auto row_amax = four_over_six ? at::empty_like(global_scales) : at::Tensor();
+  auto row_amax = four_over_six && !static_scale ? at::empty_like(global_scales) : at::Tensor();
 
   if (rows > 0) {
     const int device = matrix.get_device();
@@ -859,19 +862,25 @@ quantize_activations_cuda(
             rows,
             amax_threads,
             contraction_size);
-    auto launch = [&](auto mode, auto exact) {
+    auto launch = [&](auto mode, auto exact, auto fixed) {
       constexpr bool kFourOverSix = decltype(mode)::value;
       constexpr bool kExact = decltype(exact)::value;
-      float* amax_ptr = kFourOverSix ? row_amax.mutable_data_ptr<float>() : nullptr;
-      activation_amax_kernel<kFourOverSix><<<amax_blocks, amax_threads, 0, stream>>>(
-          reinterpret_cast<const __nv_bfloat16*>(matrix.data_ptr()),
-          global_scales.mutable_data_ptr<float>(),
-          amax_ptr,
-          rows,
-          contraction_size);
-      C10_CUDA_KERNEL_LAUNCH_CHECK();
+      constexpr bool kStatic = decltype(fixed)::value;
+      float* amax_ptr = kFourOverSix && !kStatic ? row_amax.mutable_data_ptr<float>() : nullptr;
+      if constexpr (kStatic) {
+        // A static input scale: every token's global decode scale is 1.0 (vLLM's online NVFP4 down-projection input)
+        global_scales.fill_(1.0f);
+      } else {
+        activation_amax_kernel<kFourOverSix><<<amax_blocks, amax_threads, 0, stream>>>(
+            reinterpret_cast<const __nv_bfloat16*>(matrix.data_ptr()),
+            global_scales.mutable_data_ptr<float>(),
+            amax_ptr,
+            rows,
+            contraction_size);
+        C10_CUDA_KERNEL_LAUNCH_CHECK();
+      }
       const dim3 grid(scale_row_tiles, scale_column_ctas);
-      quantize_activations_tiled_kernel<kFourOverSix, kExact>
+      quantize_activations_tiled_kernel<kFourOverSix, kExact, kStatic>
           <<<grid, kQuantThreads, 0, stream>>>(
               reinterpret_cast<const __nv_bfloat16*>(matrix.data_ptr()),
               offsets.const_data_ptr<int32_t>(),
@@ -884,11 +893,18 @@ quantize_activations_cuda(
               scale_column_tiles);
       C10_CUDA_KERNEL_LAUNCH_CHECK();
     };
+    auto launch_static = [&](auto mode, auto exact) {
+      if (static_scale) {
+        launch(mode, exact, std::true_type{});
+      } else {
+        launch(mode, exact, std::false_type{});
+      }
+    };
     auto launch_division = [&](auto mode) {
       if (exact_division) {
-        launch(mode, std::true_type{});
+        launch_static(mode, std::true_type{});
       } else {
-        launch(mode, std::false_type{});
+        launch_static(mode, std::false_type{});
       }
     };
     if (four_over_six) {

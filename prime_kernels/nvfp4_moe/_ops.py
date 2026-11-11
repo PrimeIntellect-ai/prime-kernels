@@ -10,6 +10,7 @@ def _quantize_activations_fake(
     offsets: torch.Tensor,
     four_over_six: bool = False,
     exact_division: bool = False,
+    static_scale: bool = False,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     rows, contraction_size = matrix.shape
     groups = offsets.shape[0]

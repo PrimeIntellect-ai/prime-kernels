@@ -69,9 +69,10 @@ class _GroupedNVFP4MM(torch.autograd.Function):
         weight_quantized: QuantizedExpertWeight | None,
         activations: _NVFP4Tensor | None,
         exact_division: bool,
+        static_input_scale: bool,
     ) -> torch.Tensor:
         activations_nvfp4 = activations or quantize_activations(
-            matrix, offsets, four_over_six=four_over_six, exact_division=exact_division
+            matrix, offsets, four_over_six=four_over_six, exact_division=exact_division, static_scale=static_input_scale
         )
         if weight_quantized is not None:
             if backward == "bf16" or (backward == "mxfp8" and weight_quantized.dgrad is None):
@@ -129,7 +130,7 @@ class _GroupedNVFP4MM(torch.autograd.Function):
                 grad_matrix = _dgrad(grad_output, weight, offsets, quantized, quantized_grad=rows)
             if ctx.needs_input_grad[1]:
                 grad_weight = _wgrad(grad_output, matrix, offsets, high_precision=False, quantized_grad=columns)
-            return grad_matrix, grad_weight, None, None, None, None, None, None
+            return grad_matrix, grad_weight, None, None, None, None, None, None, None
         if ctx.backward_mode == "bf16":
             matrix, weight, offsets = ctx.saved_tensors
         else:
@@ -172,7 +173,7 @@ class _GroupedNVFP4MM(torch.autograd.Function):
                 offs=offsets,
                 out_dtype=torch.bfloat16,
             )
-        return grad_matrix, grad_weight, None, None, None, None, None, None
+        return grad_matrix, grad_weight, None, None, None, None, None, None, None
 
 
 def grouped_gemm(
@@ -185,6 +186,7 @@ def grouped_gemm(
     weight_quantized: QuantizedExpertWeight | None = None,
     activations: _NVFP4Tensor | None = None,
     exact_division: bool = False,
+    static_input_scale: bool = False,
 ) -> torch.Tensor:
     """Grouped NVFP4 forward with the selected backward.
 
@@ -196,6 +198,8 @@ def grouped_gemm(
     them in BF16 on the original operands.
     ``four_over_six`` enables FlashInfer's default 448-bound, MAE 4/6 recipe. ``exact_division`` quantizes with
     IEEE-rounded reciprocals instead of FlashInfer's approximate ones; the engines must quantize the same way.
+    ``static_input_scale`` quantizes ``matrix`` with a fixed global scale of 1.0 instead of per-token ones, as vLLM's
+    NVFP4 engines quantize the down projection's input.
 
     ``weight_quantized``, ``weight`` already quantized (``quantize_expert_weight``, e.g. per FSDP shard before the
     all-gather), skips the weight quantizers; ``weight`` is then only read by the ``bf16`` backward, and its gradient
@@ -216,5 +220,5 @@ def grouped_gemm(
     if weight.device != matrix.device or weight.dtype != matrix.dtype:
         raise ValueError("weight must have the same CUDA device and dtype as matrix")
     return _GroupedNVFP4MM.apply(
-        matrix, weight, offs, backward, four_over_six, weight_quantized, activations, exact_division
+        matrix, weight, offs, backward, four_over_six, weight_quantized, activations, exact_division, static_input_scale
     )
