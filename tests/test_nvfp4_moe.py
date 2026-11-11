@@ -75,17 +75,34 @@ def test_nvfp4_forward_and_backward_operands(kernel, k, n, four_over_six):
         error = ((actual.float() - expected.float()).square().mean() / expected.float().square().mean()).sqrt()
         assert error < 0.05, error.item()
 
-    # A weight cache quantizes once and reproduces the uncached result bit for bit, forward and backward
-    cache = {}
-    uncached = (x.grad.clone(), w.grad.clone())
-    for _ in range(2):
-        x.grad = w.grad = None
-        y_cached = kernel.grouped_gemm(
-            x, w, offs=offsets, backward="mxfp8", four_over_six=four_over_six, weight_cache=cache
-        )
-        y_cached.backward(grad)
-        torch.testing.assert_close((x.grad, w.grad), uncached, rtol=0, atol=0)
-    assert set(cache) == {"forward", "dgrad"}
+
+@pytest.mark.parametrize("backward", ["mxfp8", "dequant_bf16"])
+def test_pre_quantized_shards_match_the_bf16_weight(kernel, backward):
+    """FSDP's quantized all-gather: each rank quantizes its whole-expert shard, the pieces concatenate along the
+    expert dimension, and the GEMM on them matches the GEMM on the BF16 weight bit for bit."""
+    from prime_kernels.nvfp4_moe.grouped_gemm import QuantizedExpertWeight, quantize_expert_weight
+
+    torch.manual_seed(7)
+    counts, k, n = [64, 32, 0, 96], 2048, 1536
+    offsets = torch.tensor(counts, device="cuda", dtype=torch.int32).cumsum(0, dtype=torch.int32)
+    x = (torch.randn(sum(counts), k, device="cuda") * 0.2).bfloat16().requires_grad_()
+    rows = (torch.randn(4, n, k, device="cuda") * 0.2).bfloat16()  # the parameter's [experts, out, in] layout
+    w = rows.transpose(-1, -2).requires_grad_()
+    grad = torch.randn(sum(counts), n, device="cuda", dtype=torch.bfloat16)
+
+    y = kernel.grouped_gemm(x, w, offs=offsets, backward=backward, four_over_six=True)
+    y.backward(grad)
+    expected = (y.detach(), x.grad.clone(), w.grad.clone())
+
+    shards = [quantize_expert_weight(rows[i : i + 2], four_over_six=True, backward=backward) for i in (0, 2)]
+    gathered = QuantizedExpertWeight.from_tensors(
+        tuple(torch.cat(parts) for parts in zip(*(shard.tensors() for shard in shards)))
+    )
+    x.grad = w.grad = None
+    y = kernel.grouped_gemm(x, w, offs=offsets, backward=backward, four_over_six=True, weight_quantized=gathered)
+    y.backward(grad)
+    for actual, wanted in zip((y.detach(), x.grad, w.grad), expected):
+        torch.testing.assert_close(actual, wanted, rtol=0, atol=0)
 
 
 @pytest.mark.parametrize("four_over_six", [False, True])

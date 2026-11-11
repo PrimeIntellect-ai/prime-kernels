@@ -5,7 +5,8 @@ For each model shape and tokens per expert, one expert layer (gate_up then down 
 backward with:
 - ``bf16``: torch grouped GEMMs;
 - ``mxfp8``: prime-kernels' mxfp8_moe;
-- ``nvfp4/<backward>``: nvfp4_moe with each backward, with and without the per-step weight cache.
+- ``nvfp4/<backward>``: nvfp4_moe with each backward, quantizing the weights in the GEMM or receiving them
+  pre-quantized (as FSDP's quantized all-gather would).
 
 Components (quantizers, the NVFP4 GEMM, one- vs two-pass gradient quantization) show where the time goes.
 
@@ -75,17 +76,28 @@ def bench_shape(name: str, hidden: int, inter: int, experts: int, tokens: int, k
     result["bf16"] = timed(layer(grouped, x, gate_up, down, offsets, grad))
     if mxfp8 is not None:
         result["mxfp8"] = timed(layer(lambda a, w, o: mxfp8.grouped_gemm(a, w, o), x, gate_up, down, offsets, grad))
-    for backward in ("mxfp8", "dequant_bf16", "bf16"):
-        for cache in (False, True):
-            caches = {id(gate_up): {}, id(down): {}}
+    from prime_kernels.nvfp4_moe.grouped_gemm import quantize_expert_weight
 
-            def gemm(a, w, o, backward=backward, cache=cache):
-                weight_cache = caches[id(w)] if cache else None
+    for backward in ("mxfp8", "dequant_bf16", "bf16"):
+        for prequantized in (False, True) if backward != "bf16" else (False,):
+            # Pre-quantized: what FSDP's quantized all-gather hands the GEMM (weights quantized once per gather,
+            # reused by every GEMM on them)
+            quantized = {
+                id(w): quantize_expert_weight(w.detach().transpose(-2, -1), four_over_six=True, backward=backward)
+                for w in (gate_up, down)
+            }
+
+            def gemm(a, w, o, backward=backward, prequantized=prequantized, quantized=quantized):
                 return nvfp4.grouped_gemm(
-                    a, w, offs=o, backward=backward, four_over_six=True, weight_cache=weight_cache
+                    a,
+                    w,
+                    offs=o,
+                    backward=backward,
+                    four_over_six=True,
+                    weight_quantized=quantized[id(w)] if prequantized else None,
                 )
 
-            label = f"nvfp4/{backward}" + ("+cache" if cache else "")
+            label = f"nvfp4/{backward}" + ("+prequantized" if prequantized else "")
             result[label] = timed(layer(gemm, x, gate_up, down, offsets, grad))
 
     # Components on the gate_up projection
