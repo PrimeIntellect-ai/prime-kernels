@@ -66,6 +66,15 @@ def test_nvfp4_forward_and_backward_operands(kernel, k, n, four_over_six):
         torch.testing.assert_close(x.grad, expected_dx, rtol=0, atol=0)
         torch.testing.assert_close(w.grad, expected_dw, rtol=0, atol=0)
 
+    # MXFP8 gradient GEMMs on the dequantized operands approximate the dequantized BF16 gradients
+    x.grad = w.grad = None
+    kernel.grouped_gemm(x, w, offs=offsets, backward="dequant_mxfp8", four_over_six=four_over_six).backward(grad)
+    expected_dx = F.grouped_mm(grad, dw.transpose(-1, -2), offs=offsets, out_dtype=torch.bfloat16)
+    expected_dw = F.grouped_mm(dx.T, grad, offs=offsets, out_dtype=torch.bfloat16)
+    for actual, expected in ((x.grad, expected_dx), (w.grad, expected_dw)):
+        error = ((actual.float() - expected.float()).square().mean() / expected.float().square().mean()).sqrt()
+        assert error < 0.05, error.item()
+
     # MXFP8 gradient GEMMs approximate the BF16 gradients on the original operands
     x.grad = w.grad = None
     kernel.grouped_gemm(x, w, offs=offsets, backward="mxfp8", four_over_six=four_over_six).backward(grad)
@@ -76,7 +85,7 @@ def test_nvfp4_forward_and_backward_operands(kernel, k, n, four_over_six):
         assert error < 0.05, error.item()
 
 
-@pytest.mark.parametrize("backward", ["mxfp8", "dequant_bf16"])
+@pytest.mark.parametrize("backward", ["mxfp8", "dequant_mxfp8", "dequant_bf16"])
 def test_pre_quantized_shards_match_the_bf16_weight(kernel, backward):
     """FSDP's quantized all-gather: each rank quantizes its whole-expert shard, the pieces concatenate along the
     expert dimension, and the GEMM on them matches the GEMM on the BF16 weight bit for bit."""
