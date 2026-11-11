@@ -59,8 +59,11 @@ def _check_bf16_cuda(tensor: torch.Tensor, name: str) -> None:
         raise ValueError(f"{name} must be a CUDA bfloat16 tensor")
 
 
-def quantize_activations(matrix: torch.Tensor, offsets: torch.Tensor, *, four_over_six: bool = False) -> _NVFP4Tensor:
-    """Quantize ``[M, K]`` activations with one FP32 decode scale per token."""
+def quantize_activations(
+    matrix: torch.Tensor, offsets: torch.Tensor, *, four_over_six: bool = False, exact_division: bool = False
+) -> _NVFP4Tensor:
+    """Quantize ``[M, K]`` activations with one FP32 decode scale per token. ``exact_division`` uses IEEE-rounded
+    reciprocals in the block math instead of FlashInfer's approximate ones (what vLLM's NVFP4 engines use)."""
 
     _check_blackwell()
     if matrix.ndim != 2:
@@ -79,6 +82,7 @@ def quantize_activations(matrix: torch.Tensor, offsets: torch.Tensor, *, four_ov
         matrix,
         offsets,
         four_over_six,
+        exact_division,
     )
     return _NVFP4Tensor(
         data=packed.view(torch.float4_e2m1fn_x2),
@@ -88,7 +92,7 @@ def quantize_activations(matrix: torch.Tensor, offsets: torch.Tensor, *, four_ov
     )
 
 
-def quantize_weights(weight: torch.Tensor, *, four_over_six: bool = False) -> _NVFP4Tensor:
+def quantize_weights(weight: torch.Tensor, *, four_over_six: bool = False, exact_division: bool = False) -> _NVFP4Tensor:
     """Quantize logical ``[G, K, N]`` weights with one FP32 decode scale per expert."""
 
     _check_blackwell()
@@ -108,6 +112,7 @@ def quantize_weights(weight: torch.Tensor, *, four_over_six: bool = False) -> _N
     packed, block_scales, global_scales = _quantize_weights_kernel(
         weight_rows,
         four_over_six,
+        exact_division,
     )
     return _NVFP4Tensor(
         data=packed.view(torch.float4_e2m1fn_x2),

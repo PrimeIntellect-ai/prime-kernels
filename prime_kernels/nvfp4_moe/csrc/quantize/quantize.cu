@@ -225,10 +225,17 @@ __device__ __forceinline__ Bf16Block dequantize_e2m1(
   return output;
 }
 
-__device__ __forceinline__ float reciprocal_approximate(float value) {
-  float result;
-  asm volatile("rcp.approx.ftz.f32 %0, %1;" : "=f"(result) : "f"(value));
-  return result;
+// Reciprocals in the block math: FlashInfer's approximate rcp.approx.ftz (default: the bytes vLLM's NVFP4 engines
+// produce), or the IEEE-rounded reciprocal (Composer 2 found IEEE arithmetic in NVFP4 quantization critical for RL).
+template <bool Exact>
+__device__ __forceinline__ float reciprocal(float value) {
+  if constexpr (Exact) {
+    return __frcp_rn(value);
+  } else {
+    float result;
+    asm volatile("rcp.approx.ftz.f32 %0, %1;" : "=f"(result) : "f"(value));
+    return result;
+  }
 }
 
 template <int kScaleCols>
@@ -241,6 +248,7 @@ __device__ __forceinline__ int local_scale_offset(
       (scale_column_in_cta & 3);
 }
 
+template <bool Exact>
 __device__ __forceinline__ uint8_t quantize_block(
     const Bf16Block& input,
     float global_decode_scale,
@@ -249,13 +257,13 @@ __device__ __forceinline__ uint8_t quantize_block(
   float scale_value = 0.0f;
   if (global_decode_scale > 0.0f && local_amax > 0.0f) {
     scale_value =
-        local_amax * reciprocal_approximate(6.0f * global_decode_scale);
+        local_amax * reciprocal<Exact>(6.0f * global_decode_scale);
   }
   const __nv_fp8_e4m3 fp8_scale(scale_value);
   const float decode_scale =
       static_cast<float>(fp8_scale) * global_decode_scale;
   const float coefficient =
-      decode_scale > 0.0f ? reciprocal_approximate(decode_scale) : 0.0f;
+      decode_scale > 0.0f ? reciprocal<Exact>(decode_scale) : 0.0f;
   *packed = pack_e2m1(input, coefficient);
   return fp8_scale.__x;
 }
@@ -293,7 +301,7 @@ __device__ __forceinline__ float four_over_six_error(
   return error;
 }
 
-template <bool PerToken>
+template <bool PerToken, bool Exact>
 __device__ __forceinline__ uint8_t quantize_block_four_over_six(
     const Bf16Block& input,
     float global_amax,
@@ -305,19 +313,19 @@ __device__ __forceinline__ uint8_t quantize_block_four_over_six(
     return 0;
   }
   const float encode_scale = PerToken
-      ? reciprocal_approximate(stored_decode_scale)
+      ? reciprocal<Exact>(stored_decode_scale)
       : __fdiv_rn(kGlobalScaleDenominator, fmaxf(global_amax, 1e-8f));
-  const float decode_scale = reciprocal_approximate(encode_scale);
+  const float decode_scale = reciprocal<Exact>(encode_scale);
   const float scale6_value = __fmul_rn(
-      encode_scale, __fmul_rn(local_amax, reciprocal_approximate(6.0f)));
+      encode_scale, __fmul_rn(local_amax, reciprocal<Exact>(6.0f)));
   const __nv_fp8_e4m3 scale6(scale6_value);
   const __nv_fp8_e4m3 scale4(__fmul_rn(scale6_value, 1.5f));
   const float sf6 = static_cast<float>(scale6);
   const float sf4 = static_cast<float>(scale4);
   const uint64_t packed6 = pack_e2m1(
-      input, reciprocal_approximate(__fmul_rn(sf6, decode_scale)));
+      input, reciprocal<Exact>(__fmul_rn(sf6, decode_scale)));
   const uint64_t packed4 = pack_e2m1(
-      input, reciprocal_approximate(__fmul_rn(sf4, decode_scale)));
+      input, reciprocal<Exact>(__fmul_rn(sf4, decode_scale)));
   const float error6 = four_over_six_error<PerToken>(
       input, packed6, sf6, decode_scale, global_amax);
   const float error4 = four_over_six_error<PerToken>(
@@ -437,7 +445,7 @@ __global__ void finalize_weight_scales_kernel(
   }
 }
 
-template <bool FourOverSix>
+template <bool FourOverSix, bool Exact>
 __global__ void quantize_activations_tiled_kernel(
     const __nv_bfloat16* __restrict__ input,
     const int32_t* __restrict__ offsets,
@@ -482,13 +490,13 @@ __global__ void quantize_activations_tiled_kernel(
           scale_column * kSfVectorSize;
       uint64_t packed_value;
       if constexpr (FourOverSix) {
-        scale = quantize_block_four_over_six<true>(
+        scale = quantize_block_four_over_six<true, Exact>(
             load_bf16_block(input + input_offset),
             row_amax[row],
             global_scales[row],
             &packed_value);
       } else {
-        scale = quantize_block(
+        scale = quantize_block<Exact>(
             load_bf16_block(input + input_offset),
             global_scales[row],
             &packed_value);
@@ -527,7 +535,7 @@ __global__ void quantize_activations_tiled_kernel(
   }
 }
 
-template <bool FourOverSix>
+template <bool FourOverSix, bool Exact>
 __global__ void quantize_weights_tiled_kernel(
     const __nv_bfloat16* __restrict__ input,
     const float* __restrict__ global_scales,
@@ -560,13 +568,13 @@ __global__ void quantize_weights_tiled_kernel(
           row * contraction_size + scale_column * kSfVectorSize;
       uint64_t packed_value;
       if constexpr (FourOverSix) {
-        scale = quantize_block_four_over_six<false>(
+        scale = quantize_block_four_over_six<false, Exact>(
             load_bf16_block(input + input_offset),
             expert_amax[expert],
             global_scales[expert],
             &packed_value);
       } else {
-        scale = quantize_block(
+        scale = quantize_block<Exact>(
             load_bf16_block(input + input_offset),
             global_scales[expert],
             &packed_value);
@@ -794,7 +802,8 @@ std::tuple<at::Tensor, at::Tensor, at::Tensor>
 quantize_activations_cuda(
     const at::Tensor& matrix,
     const at::Tensor& offsets,
-    bool four_over_six) {
+    bool four_over_six,
+    bool exact_division) {
   check_bf16_matrix(matrix, "matrix");
   TORCH_CHECK(matrix.dim() == 2, "matrix must be 2D.");
   TORCH_CHECK(
@@ -850,8 +859,9 @@ quantize_activations_cuda(
             rows,
             amax_threads,
             contraction_size);
-    auto launch = [&](auto mode) {
+    auto launch = [&](auto mode, auto exact) {
       constexpr bool kFourOverSix = decltype(mode)::value;
+      constexpr bool kExact = decltype(exact)::value;
       float* amax_ptr = kFourOverSix ? row_amax.mutable_data_ptr<float>() : nullptr;
       activation_amax_kernel<kFourOverSix><<<amax_blocks, amax_threads, 0, stream>>>(
           reinterpret_cast<const __nv_bfloat16*>(matrix.data_ptr()),
@@ -861,7 +871,7 @@ quantize_activations_cuda(
           contraction_size);
       C10_CUDA_KERNEL_LAUNCH_CHECK();
       const dim3 grid(scale_row_tiles, scale_column_ctas);
-      quantize_activations_tiled_kernel<kFourOverSix>
+      quantize_activations_tiled_kernel<kFourOverSix, kExact>
           <<<grid, kQuantThreads, 0, stream>>>(
               reinterpret_cast<const __nv_bfloat16*>(matrix.data_ptr()),
               offsets.const_data_ptr<int32_t>(),
@@ -874,17 +884,24 @@ quantize_activations_cuda(
               scale_column_tiles);
       C10_CUDA_KERNEL_LAUNCH_CHECK();
     };
+    auto launch_division = [&](auto mode) {
+      if (exact_division) {
+        launch(mode, std::true_type{});
+      } else {
+        launch(mode, std::false_type{});
+      }
+    };
     if (four_over_six) {
-      launch(std::true_type{});
+      launch_division(std::true_type{});
     } else {
-      launch(std::false_type{});
+      launch_division(std::false_type{});
     }
   }
   return {packed, block_scales, global_scales};
 }
 
 std::tuple<at::Tensor, at::Tensor, at::Tensor>
-quantize_weights_cuda(const at::Tensor& weight_rows, bool four_over_six) {
+quantize_weights_cuda(const at::Tensor& weight_rows, bool four_over_six, bool exact_division) {
   check_bf16_matrix(weight_rows, "weight_rows");
   TORCH_CHECK(weight_rows.dim() == 3, "weight_rows must be 3D.");
   TORCH_CHECK(weight_rows.size(0) > 0, "weight_rows must contain an expert.");
@@ -939,8 +956,9 @@ quantize_weights_cuda(const at::Tensor& weight_rows, bool four_over_six) {
             output_size * contraction_size,
             blocks_per_expert);
     C10_CUDA_KERNEL_LAUNCH_CHECK();
-    auto launch = [&](auto mode) {
+    auto launch = [&](auto mode, auto exact) {
       constexpr bool kFourOverSix = decltype(mode)::value;
+      constexpr bool kExact = decltype(exact)::value;
       finalize_weight_scales_kernel<kFourOverSix><<<1, 256, 0, stream>>>(
           expert_amax.const_data_ptr<float>(),
           global_scales.mutable_data_ptr<float>(),
@@ -949,7 +967,7 @@ quantize_weights_cuda(const at::Tensor& weight_rows, bool four_over_six) {
       const dim3 grid(
           groups * output_row_tiles,
           scale_column_ctas);
-      quantize_weights_tiled_kernel<kFourOverSix>
+      quantize_weights_tiled_kernel<kFourOverSix, kExact>
           <<<grid, kQuantThreads, 0, stream>>>(
               reinterpret_cast<const __nv_bfloat16*>(
                   weight_rows.data_ptr()),
@@ -963,10 +981,17 @@ quantize_weights_cuda(const at::Tensor& weight_rows, bool four_over_six) {
               scale_column_tiles);
       C10_CUDA_KERNEL_LAUNCH_CHECK();
     };
+    auto launch_division = [&](auto mode) {
+      if (exact_division) {
+        launch(mode, std::true_type{});
+      } else {
+        launch(mode, std::false_type{});
+      }
+    };
     if (four_over_six) {
-      launch(std::true_type{});
+      launch_division(std::true_type{});
     } else {
-      launch(std::false_type{});
+      launch_division(std::false_type{});
     }
   }
   return {packed, block_scales, global_scales};
