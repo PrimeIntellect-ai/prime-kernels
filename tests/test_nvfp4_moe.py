@@ -126,3 +126,22 @@ def test_nvfp4_token_locality_and_zero_rows(kernel, four_over_six):
         four_over_six=four_over_six,
     )
     assert empty.shape == (0, 256)
+
+
+@pytest.mark.parametrize("grad_scale", [1.0, 1e-10, 1e-12])
+def test_mxfp8_backward_keeps_rl_sized_gradients(kernel, grad_scale):
+    """prime-rl's RL loss normalization puts gradients at 1e-9 to 1e-11. A quantizer scale floor (like the 2^-22 one
+    that zeroed prime-mega-moe's MXFP8 expert gradients in INTELLECT-4 RL) would flush them: the MXFP8 gradients must
+    stay as accurate, relative to their size, at every scale."""
+    torch.manual_seed(3)
+    counts, k, n = [64, 96], 2048, 1536
+    offsets = torch.tensor(counts, device="cuda", dtype=torch.int32).cumsum(0, dtype=torch.int32)
+    x = (torch.randn(sum(counts), k, device="cuda") * 0.2).bfloat16().requires_grad_()
+    w = (torch.randn(2, n, k, device="cuda") * 0.02).bfloat16().transpose(-1, -2).requires_grad_()
+    grad = (torch.randn(sum(counts), n, device="cuda") * grad_scale).bfloat16()
+    kernel.grouped_gemm(x, w, offs=offsets, backward="mxfp8", four_over_six=True).backward(grad)
+    expected_dx = F.grouped_mm(grad.float(), w.float().transpose(-1, -2), offs=offsets)
+    expected_dw = F.grouped_mm(x.float().T, grad.float(), offs=offsets)
+    for actual, expected in ((x.grad, expected_dx), (w.grad, expected_dw)):
+        error = ((actual.float() - expected).square().mean() / expected.square().mean()).sqrt()
+        assert error < 0.05, (grad_scale, error.item())
