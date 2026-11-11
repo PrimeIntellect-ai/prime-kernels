@@ -110,6 +110,21 @@ def _quantize_dim1(x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
     return mx.qdata, mx.scale
 
 
+def quantize_grad(grad_output: torch.Tensor) -> tuple[tuple[torch.Tensor, torch.Tensor], tuple[torch.Tensor, torch.Tensor]]:
+    """`grad_output` quantized for both gradient GEMMs in one read: along rows for the input gradient and along
+    columns (the token dim) for the weight gradient. The same RCEIL scaling as `quantize_rows` and `_quantize_dim1`,
+    which it replaces when both are needed."""
+    rows, cols = grad_output.shape
+    if rows == 0 or rows % TOKEN_GROUP_ALIGNMENT or cols % TOKEN_GROUP_ALIGNMENT:
+        return quantize_rows(grad_output), _quantize_dim1(grad_output)
+    from torchao.prototype.mx_formats.kernels import mxfp8_quantize_cuda
+
+    row_data, column_data, row_scales, column_scales = mxfp8_quantize_cuda(
+        grad_output.contiguous(), rowwise=True, colwise=True, scaling_mode=_SCALING_MODE.value.lower()
+    )
+    return (row_data, row_scales.view(rows, cols // TOKEN_GROUP_ALIGNMENT)), (column_data.t(), column_scales)
+
+
 def _forward(input_act: torch.Tensor, weight_t: torch.Tensor, offsets: torch.Tensor) -> torch.Tensor:
     input_data, input_scales = quantize_rows(input_act)
     weight_data, weight_scales = _quantize_rows(weight_t.transpose(-2, -1))
@@ -136,8 +151,9 @@ def _dgrad(
     weight_t: torch.Tensor,
     offsets: torch.Tensor,
     quantized_weight: tuple[torch.Tensor, torch.Tensor] | None = None,
+    quantized_grad: tuple[torch.Tensor, torch.Tensor] | None = None,
 ) -> torch.Tensor:
-    grad_data, grad_scales = quantize_rows(grad_output)
+    grad_data, grad_scales = quantized_grad or quantize_rows(grad_output)
     weight_data, weight_scales = quantized_weight or _dgrad_weight(weight_t)
     return torch._scaled_grouped_mm(
         grad_data,
@@ -155,6 +171,7 @@ def _wgrad(
     offsets: torch.Tensor,
     *,
     high_precision: bool,
+    quantized_grad: tuple[torch.Tensor, torch.Tensor] | None = None,
 ) -> torch.Tensor:
     if high_precision:
         grad_weight = torch._grouped_mm(
@@ -165,7 +182,7 @@ def _wgrad(
         )
         return grad_weight.transpose(-2, -1)
 
-    grad_data, grad_scales = _quantize_dim1(grad_output)
+    grad_data, grad_scales = quantized_grad or _quantize_dim1(grad_output)
     input_data, input_scales = _quantize_dim1(input_act)
     scale_offsets = offsets // TOKEN_GROUP_ALIGNMENT
     grad_weight = torch._scaled_grouped_mm(
@@ -195,17 +212,16 @@ class _GroupedGemm(torch.autograd.Function):
     @staticmethod
     def backward(ctx, grad_output: torch.Tensor):
         input_act, weight_t, offsets = ctx.saved_tensors
-        grad_input = _dgrad(grad_output, weight_t, offsets) if ctx.needs_input_grad[0] else None
-        grad_weight = (
-            _wgrad(
-                grad_output,
-                input_act,
-                offsets,
-                high_precision=ctx.high_precision_wgrad,
+        rows = columns = None
+        if ctx.needs_input_grad[0] and ctx.needs_input_grad[1] and not ctx.high_precision_wgrad:
+            rows, columns = quantize_grad(grad_output)
+        grad_input = grad_weight = None
+        if ctx.needs_input_grad[0]:
+            grad_input = _dgrad(grad_output, weight_t, offsets, quantized_grad=rows)
+        if ctx.needs_input_grad[1]:
+            grad_weight = _wgrad(
+                grad_output, input_act, offsets, high_precision=ctx.high_precision_wgrad, quantized_grad=columns
             )
-            if ctx.needs_input_grad[1]
-            else None
-        )
         return grad_input, grad_weight, None, None
 
 

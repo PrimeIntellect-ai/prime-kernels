@@ -33,8 +33,9 @@ class _GroupedNVFP4MM(torch.autograd.Function):
         backward: NVFP4Backward,
         four_over_six: bool,
         weight_cache: dict | None,
+        activations: _NVFP4Tensor | None,
     ) -> torch.Tensor:
-        activations_nvfp4 = quantize_activations(matrix, offsets, four_over_six=four_over_six)
+        activations_nvfp4 = activations or quantize_activations(matrix, offsets, four_over_six=four_over_six)
         weight_nvfp4 = _cached(weight_cache, "forward", lambda: quantize_weights(weight, four_over_six=four_over_six))
         output = _grouped_mm_kernel(
             activations_nvfp4.data,
@@ -67,17 +68,20 @@ class _GroupedNVFP4MM(torch.autograd.Function):
         if ctx.backward_mode == "mxfp8":
             # MXFP8 gradient GEMMs on the original BF16 operands (E4M3 values, E8M0 scales per 32 elements): the
             # backward never meets the sampler, so it trades exactness for speed
-            from prime_kernels.mxfp8_moe.grouped_gemm import _dgrad, _dgrad_weight, _wgrad
+            from prime_kernels.mxfp8_moe.grouped_gemm import _dgrad, _dgrad_weight, _wgrad, quantize_grad
 
             matrix, weight, offsets = ctx.saved_tensors
-            grad_matrix = None
+            # Both gradient GEMMs need grad_output: quantize it along rows and columns in one read
+            rows = columns = None
+            if ctx.needs_input_grad[0] and ctx.needs_input_grad[1]:
+                rows, columns = quantize_grad(grad_output)
+            grad_matrix = grad_weight = None
             if ctx.needs_input_grad[0]:
                 quantized = _cached(ctx.weight_cache, "dgrad", lambda: _dgrad_weight(weight))
-                grad_matrix = _dgrad(grad_output, weight, offsets, quantized)
-            grad_weight = (
-                _wgrad(grad_output, matrix, offsets, high_precision=False) if ctx.needs_input_grad[1] else None
-            )
-            return grad_matrix, grad_weight, None, None, None, None
+                grad_matrix = _dgrad(grad_output, weight, offsets, quantized, quantized_grad=rows)
+            if ctx.needs_input_grad[1]:
+                grad_weight = _wgrad(grad_output, matrix, offsets, high_precision=False, quantized_grad=columns)
+            return grad_matrix, grad_weight, None, None, None, None, None
         if ctx.backward_mode == "bf16":
             matrix, weight, offsets = ctx.saved_tensors
         else:
@@ -120,7 +124,7 @@ class _GroupedNVFP4MM(torch.autograd.Function):
                 offs=offsets,
                 out_dtype=torch.bfloat16,
             )
-        return grad_matrix, grad_weight, None, None, None, None
+        return grad_matrix, grad_weight, None, None, None, None, None
 
 
 def grouped_gemm(
@@ -131,6 +135,7 @@ def grouped_gemm(
     backward: NVFP4Backward = "dequant_bf16",
     four_over_six: bool = False,
     weight_cache: dict | None = None,
+    activations: _NVFP4Tensor | None = None,
 ) -> torch.Tensor:
     """Grouped NVFP4 forward with the selected backward.
 
@@ -146,6 +151,9 @@ def grouped_gemm(
     MXFP8 for the input gradient) across calls: micro-batches and activation-checkpoint recomputes of one optimizer
     step quantize each weight once. The caller must clear it whenever the weight changes. It holds ~0.8x the
     weight's BF16 bytes (less without the ``mxfp8`` backward).
+
+    ``activations``, ``matrix`` already quantized (``dispatch.group_tokens`` of tokens quantized before dispatch),
+    skips the activation quantizer; ``matrix`` stays the BF16 operand of the backward.
     """
 
     if backward not in ("mxfp8", "dequant_bf16", "bf16"):
@@ -158,4 +166,4 @@ def grouped_gemm(
         raise ValueError("matrix and weight contraction dimensions must match")
     if weight.device != matrix.device or weight.dtype != matrix.dtype:
         raise ValueError("weight must have the same CUDA device and dtype as matrix")
-    return _GroupedNVFP4MM.apply(matrix, weight, offs, backward, four_over_six, weight_cache)
+    return _GroupedNVFP4MM.apply(matrix, weight, offs, backward, four_over_six, weight_cache, activations)
