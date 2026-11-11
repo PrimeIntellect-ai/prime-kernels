@@ -75,18 +75,6 @@ def test_nvfp4_forward_and_backward_operands(kernel, k, n, four_over_six):
         error = ((actual.float() - expected.float()).square().mean() / expected.float().square().mean()).sqrt()
         assert error < 0.05, error.item()
 
-    # A weight cache quantizes once and reproduces the uncached result bit for bit, forward and backward
-    cache = {}
-    uncached = (x.grad.clone(), w.grad.clone())
-    for _ in range(2):
-        x.grad = w.grad = None
-        y_cached = kernel.grouped_gemm(
-            x, w, offs=offsets, backward="mxfp8", four_over_six=four_over_six, weight_cache=cache
-        )
-        y_cached.backward(grad)
-        torch.testing.assert_close((x.grad, w.grad), uncached, rtol=0, atol=0)
-    assert set(cache) == {"forward", "dgrad"}
-
 
 @pytest.mark.parametrize("four_over_six", [False, True])
 def test_nvfp4_token_locality_and_zero_rows(kernel, four_over_six):

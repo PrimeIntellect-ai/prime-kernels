@@ -123,27 +123,16 @@ def _forward(input_act: torch.Tensor, weight_t: torch.Tensor, offsets: torch.Ten
     )
 
 
-def _dgrad_weight(weight_t: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
-    """`weight_t` (E, K, N) quantized for the input-gradient GEMM: along N, the contraction, with the same Triton row
-    quantizer the forward uses (torchao's CuTe-DSL 3D quantizer fails to compile on SM103), and its scales swizzled.
-    It depends on the weights alone, so callers may reuse it until they change."""
-    weight_data, weight_scales = _quantize_rows(weight_t.contiguous())
-    return weight_data.transpose(-2, -1), triton_mx_block_rearrange_per_group_3d(weight_scales)
-
-
-def _dgrad(
-    grad_output: torch.Tensor,
-    weight_t: torch.Tensor,
-    offsets: torch.Tensor,
-    quantized_weight: tuple[torch.Tensor, torch.Tensor] | None = None,
-) -> torch.Tensor:
+def _dgrad(grad_output: torch.Tensor, weight_t: torch.Tensor, offsets: torch.Tensor) -> torch.Tensor:
     grad_data, grad_scales = quantize_rows(grad_output)
-    weight_data, weight_scales = quantized_weight or _dgrad_weight(weight_t)
+    # The contraction runs over N, so quantize `weight_t` (E, K, N) along N with the same Triton
+    # row quantizer the forward uses; torchao's CuTe-DSL 3D quantizer fails to compile on SM103.
+    weight_data, weight_scales = _quantize_rows(weight_t.contiguous())
     return torch._scaled_grouped_mm(
         grad_data,
-        weight_data,
+        weight_data.transpose(-2, -1),
         _rearrange_token_scales(grad_scales, offsets),
-        weight_scales,
+        triton_mx_block_rearrange_per_group_3d(weight_scales),
         offs=offsets,
         out_dtype=torch.bfloat16,
     )
