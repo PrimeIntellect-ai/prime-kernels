@@ -1,10 +1,12 @@
 from . import _C  # noqa: F401
-from .grouped_gemm import grouped_gemm
+from .grouped_gemm import QuantizedExpertWeight, grouped_gemm, quantize_expert_weight
 from .quantize import quantize_activations, quantize_weights
 
 __all__ = [
     "TOKEN_GROUP_ALIGNMENT",
+    "QuantizedExpertWeight",
     "grouped_gemm",
+    "quantize_expert_weight",
     "quantize_activations",
     "quantize_weights",
     "unsupported_shape_reason",
