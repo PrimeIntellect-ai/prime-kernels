@@ -748,6 +748,273 @@ int activation_amax_blocks(
   return std::min(rows, properties->multiProcessorCount * blocks_per_sm);
 }
 
+
+// ── MXFP8 with stochastic rounding, for the backward's gradient GEMMs ────────
+//
+// One pass per operand: a 32 x 128 tile of the source (BF16, or an NVFP4 operand dequantized exactly as
+// dequantize_e2m1 does) is staged in shared memory, then quantized to MXFP8 (E4M3 values, E8M0 scales per 32) along
+// its rows and/or its columns, so a gradient's row-wise and column-wise forms come from one read and neither needs a
+// transpose pass. Scales are torchao's RCEIL scales, computed exactly from the float bits. Rounding is stochastic:
+// each value rounds down or up to its E4M3 neighbours with probability in proportion to its distance from the other,
+// from 16 random bits drawn by Philox4x32-10 keyed by the seed and counted by (output index / 8, call). stochastic.py
+// holds the same algorithm in PyTorch as the reference, so both give the same bits for the same seed and call.
+
+constexpr int kMxBlock = 32;
+constexpr int kSrTileRows = 32;
+constexpr int kSrTileCols = 128;
+constexpr int kSrPitch = kSrTileCols + 8;
+
+__device__ __forceinline__ uint4 philox4x32_10(uint32_t c0, uint32_t c1, uint32_t c2, uint32_t c3, uint32_t k0,
+                                               uint32_t k1) {
+#pragma unroll
+  for (int round = 0; round < 10; ++round) {
+    const uint32_t lo0 = 0xD2511F53u * c0, hi0 = __umulhi(0xD2511F53u, c0);
+    const uint32_t lo1 = 0xCD9E8D57u * c2, hi1 = __umulhi(0xCD9E8D57u, c2);
+    c0 = hi1 ^ c1 ^ k0;
+    c1 = lo1;
+    c2 = hi0 ^ c3 ^ k1;
+    c3 = lo0;
+    k0 += 0x9E3779B9u;
+    k1 += 0xBB67AE85u;
+  }
+  return make_uint4(c0, c1, c2, c3);
+}
+
+// 16 random 16-bit draws for the outputs [start, start + 16), start a multiple of 16
+__device__ __forceinline__ void random16x16(int64_t start, uint32_t call, uint32_t seed_lo, uint32_t seed_hi,
+                                            uint32_t* draws) {
+#pragma unroll
+  for (int half = 0; half < 2; ++half) {
+    const uint64_t counter = static_cast<uint64_t>(start) / 8 + half;
+    const uint4 words = philox4x32_10(static_cast<uint32_t>(counter), static_cast<uint32_t>(counter >> 32), call,
+                                      0u, seed_lo, seed_hi);
+    const uint32_t word[4] = {words.x, words.y, words.z, words.w};
+#pragma unroll
+    for (int index = 0; index < 8; ++index) {
+      draws[half * 8 + index] = (word[index / 2] >> (16 * (index % 2))) & 0xFFFFu;
+    }
+  }
+}
+
+// torchao's RCEIL scale: ceil(log2(amax / 448)) + 127, clamped to [0, 254] (255 for NaN)
+__device__ __forceinline__ int e8m0_rceil(float amax) {
+  const uint32_t bits = __float_as_uint(__fdiv_rn(amax, 448.0f));
+  const int exponent = (bits >> 23) & 0xff;
+  const uint32_t mantissa = bits & 0x7fffff;
+  if (exponent == 0xff) {
+    return mantissa ? 255 : 254;
+  }
+  if (exponent == 0 && mantissa == 0) {
+    return 0;
+  }
+  const int ceil_log2 = exponent ? exponent - 127 + (mantissa != 0) : -149 + (32 - __clz(mantissa - 1));
+  return min(max(ceil_log2, -127), 127) + 127;
+}
+
+__device__ __forceinline__ float e8m0_reciprocal(int exponent) {
+  if (exponent == 0) {
+    return 1.0f;
+  }
+  if (exponent == 254) {
+    return __uint_as_float(1u << 22);  // 2^-127
+  }
+  if (exponent == 255) {
+    return __uint_as_float(0x7fc00000u);
+  }
+  return __uint_as_float(static_cast<uint32_t>(254 - exponent) << 23);
+}
+
+__device__ __forceinline__ uint8_t stochastic_e4m3(float value, float reciprocal_scale, uint32_t draw) {
+  float scaled = value * reciprocal_scale;
+  if (scaled != scaled) {
+    return 0x7f;
+  }
+  scaled = scaled > 448.0f ? 448.0f : (scaled < -448.0f ? -448.0f : scaled);
+  const float magnitude = fabsf(scaled);
+  // The E4M3 step of the value's binade (subnormal below 2^-6)
+  const int exponent = max(static_cast<int>((__float_as_uint(magnitude) >> 23) & 0xff) - 127, -6);
+  const float step = __uint_as_float(static_cast<uint32_t>(exponent - 3 + 127) << 23);
+  const float inverse = __uint_as_float(static_cast<uint32_t>(127 - (exponent - 3)) << 23);
+  const float noise = static_cast<float>(draw) * 0x1p-16f;
+  const float rounded = fminf(floorf(__fadd_rn(__fmul_rn(magnitude, inverse), noise)) * step, 448.0f);
+  return __nv_cvt_float_to_fp8(copysignf(rounded, scaled), __NV_SATFINITE, __NV_E4M3);
+}
+
+// Sources: write 16 consecutive values (row, col .. col + 16) of matrix z as BF16 into dst
+struct Bf16Source {
+  const __nv_bfloat16* values;
+  int64_t rows, cols;
+  __device__ void load16(int z, int row, int col, __nv_bfloat16* dst) const {
+    const auto* src = reinterpret_cast<const uint4*>(values + (static_cast<int64_t>(z) * rows + row) * cols + col);
+    reinterpret_cast<uint4*>(dst)[0] = __ldcg(src);
+    reinterpret_cast<uint4*>(dst)[1] = __ldcg(src + 1);
+  }
+};
+
+__device__ __forceinline__ int64_t swizzled_scale_offset(int64_t tile, int row_in_tile, int scale_col,
+                                                         int scale_column_tiles) {
+  return (tile * scale_column_tiles + (scale_col >> 2)) * (kScaleRowTile * kScaleColTile) +
+         (((row_in_tile & 31) << 4) | (((row_in_tile >> 5) & 3) << 2) | (scale_col & 3));
+}
+
+__device__ __forceinline__ void store_dequantized(uint64_t packed, uint8_t scale_bits, float global_scale,
+                                                  __nv_bfloat16* dst) {
+  __nv_fp8_e4m3 scale;
+  scale.__x = scale_bits;
+  const Bf16Block values = dequantize_e2m1(packed, static_cast<float>(scale) * global_scale);
+  reinterpret_cast<uint4*>(dst)[0] = values.vectors[0];
+  reinterpret_cast<uint4*>(dst)[1] = values.vectors[1];
+}
+
+// Activations [M, K] with per-token global scales and block scales in row tiles padded per group
+struct NVFP4ActivationSource {
+  const uint8_t* packed;
+  const uint8_t* block_scales;
+  const float* global_scales;
+  const int32_t* offsets;
+  int groups, contraction, scale_column_tiles;
+  __device__ void load16(int, int row, int col, __nv_bfloat16* dst) const {
+    int group_start = 0, tile_start = 0;
+    for (int group = 0; group < groups; ++group) {
+      const int group_end = offsets[group];
+      if (row < group_end) {
+        break;
+      }
+      tile_start += (group_end - group_start + kScaleRowTile - 1) / kScaleRowTile;
+      group_start = group_end;
+    }
+    const int row_in_group = row - group_start;
+    const int64_t tile = tile_start + row_in_group / kScaleRowTile;
+    const uint64_t value =
+        *reinterpret_cast<const uint64_t*>(packed + static_cast<int64_t>(row) * (contraction / 2) + col / 2);
+    const uint8_t scale =
+        block_scales[swizzled_scale_offset(tile, row_in_group % kScaleRowTile, col / kSfVectorSize,
+                                           scale_column_tiles)];
+    store_dequantized(value, scale, global_scales[row], dst);
+  }
+};
+
+// Expert weights stored [G, N, K] (rows N, contraction K) with per-expert global scales, rows padded to 128
+struct NVFP4WeightSource {
+  const uint8_t* packed;
+  const uint8_t* block_scales;
+  const float* global_scales;
+  int output_size, contraction, output_row_tiles, scale_column_tiles;
+  __device__ void load16(int expert, int row, int col, __nv_bfloat16* dst) const {
+    const uint64_t value = *reinterpret_cast<const uint64_t*>(
+        packed + (static_cast<int64_t>(expert) * output_size + row) * (contraction / 2) + col / 2);
+    const int64_t tile = static_cast<int64_t>(expert) * output_row_tiles + row / kScaleRowTile;
+    const uint8_t scale =
+        block_scales[swizzled_scale_offset(tile, row % kScaleRowTile, col / kSfVectorSize, scale_column_tiles)];
+    store_dequantized(value, scale, global_scales[expert], dst);
+  }
+};
+
+struct SrOutputs {
+  uint8_t* rows_data;    // [Z, rows, cols]
+  uint8_t* rows_scales;  // [Z, rows, cols / 32]
+  uint8_t* cols_data;    // [Z, cols, rows]
+  uint8_t* cols_scales;  // [Z, cols, rows / 32]
+};
+
+__device__ __forceinline__ void quantize16(const float* values, float amax, int64_t start, uint32_t call,
+                                           uint32_t seed_lo, uint32_t seed_hi, uint8_t* data, uint8_t* scale,
+                                           bool write_scale) {
+  const int exponent = e8m0_rceil(amax);
+  const float reciprocal_scale = e8m0_reciprocal(exponent);
+  uint32_t draws[16];
+  random16x16(start, call, seed_lo, seed_hi, draws);
+  alignas(16) uint8_t bytes[16];
+#pragma unroll
+  for (int index = 0; index < 16; ++index) {
+    bytes[index] = stochastic_e4m3(values[index], reciprocal_scale, draws[index]);
+  }
+  *reinterpret_cast<uint4*>(data) = *reinterpret_cast<const uint4*>(bytes);
+  if (write_scale) {
+    *scale = static_cast<uint8_t>(exponent);
+  }
+}
+
+template <class Source, bool kRows, bool kCols>
+__global__ void mxfp8_stochastic_kernel(Source source, SrOutputs out, int rows, int cols, uint32_t seed_lo,
+                                        uint32_t seed_hi, uint32_t call_rows, uint32_t call_cols) {
+  __shared__ alignas(16) __nv_bfloat16 tile[kSrTileRows][kSrPitch];
+  const int z = blockIdx.z;
+  const int row0 = blockIdx.y * kSrTileRows;
+  const int col0 = blockIdx.x * kSrTileCols;
+  {
+    const int row = threadIdx.x / 8, chunk = (threadIdx.x % 8) * 16;
+    if (col0 + chunk < cols) {
+      source.load16(z, row0 + row, col0 + chunk, &tile[row][chunk]);
+    } else {
+      reinterpret_cast<uint4*>(&tile[row][chunk])[0] = make_uint4(0, 0, 0, 0);
+      reinterpret_cast<uint4*>(&tile[row][chunk])[1] = make_uint4(0, 0, 0, 0);
+    }
+  }
+  __syncthreads();
+  const int half = threadIdx.x % 2;
+  float values[16];
+  if constexpr (kRows) {
+    // Two threads per 32-wide block of a row
+    const int block = threadIdx.x / 2, row = block / 4, col = (block % 4) * kMxBlock + half * 16;
+    float amax = 0.0f;
+#pragma unroll
+    for (int index = 0; index < 16; ++index) {
+      values[index] = __bfloat162float(tile[row][col + index]);
+      amax = fmaxf(amax, fabsf(values[index]));
+    }
+    amax = fmaxf(amax, __shfl_xor_sync(0xffffffffu, amax, 1));
+    if (col0 + col < cols) {
+      const int64_t out_row = static_cast<int64_t>(z) * rows + row0 + row;
+      const int64_t start = out_row * cols + col0 + col;
+      quantize16(values, amax, start, call_rows, seed_lo, seed_hi, out.rows_data + start,
+                 out.rows_scales + out_row * (cols / kMxBlock) + (col0 + col) / kMxBlock, half == 0);
+    }
+  }
+  if constexpr (kCols) {
+    // Two threads per column, 16 rows each
+    const int col = threadIdx.x / 2, row = half * 16;
+    float amax = 0.0f;
+#pragma unroll
+    for (int index = 0; index < 16; ++index) {
+      values[index] = __bfloat162float(tile[row + index][col]);
+      amax = fmaxf(amax, fabsf(values[index]));
+    }
+    amax = fmaxf(amax, __shfl_xor_sync(0xffffffffu, amax, 1));
+    if (col0 + col < cols) {
+      const int64_t out_row = static_cast<int64_t>(z) * cols + col0 + col;
+      const int64_t start = out_row * rows + row0 + row;
+      quantize16(values, amax, start, call_cols, seed_lo, seed_hi, out.cols_data + start,
+                 out.cols_scales + out_row * (rows / kMxBlock) + row0 / kMxBlock, half == 0);
+    }
+  }
+}
+
+void check_blackwell() {
+  const auto* properties = at::cuda::getDeviceProperties(at::cuda::current_device());
+  TORCH_CHECK(properties->major == 10 && (properties->minor == 0 || properties->minor == 3),
+              "MXFP8 stochastic quantization requires SM100 or SM103, but the current device is SM",
+              properties->major, properties->minor, ".");
+}
+
+template <class Source, bool kRows, bool kCols>
+void launch_stochastic(const Source& source, const SrOutputs& out, int64_t z, int64_t rows, int64_t cols, int64_t seed,
+                       int64_t call_rows, int64_t call_cols, const at::Tensor& like) {
+  if (rows == 0 || cols == 0 || z == 0) {
+    return;
+  }
+  const dim3 grid((cols + kSrTileCols - 1) / kSrTileCols, rows / kSrTileRows, z);
+  mxfp8_stochastic_kernel<Source, kRows, kCols><<<grid, 256, 0, at::cuda::getCurrentCUDAStream(like.get_device())>>>(
+      source, out, rows, cols, static_cast<uint32_t>(static_cast<uint64_t>(seed)),
+      static_cast<uint32_t>(static_cast<uint64_t>(seed) >> 32), static_cast<uint32_t>(call_rows),
+      static_cast<uint32_t>(call_cols));
+  C10_CUDA_KERNEL_LAUNCH_CHECK();
+}
+
+uint8_t* byte_ptr(const at::Tensor& tensor) {
+  return tensor.numel() ? reinterpret_cast<uint8_t*>(tensor.data_ptr()) : nullptr;
+}
+
 } // namespace
 
 std::tuple<at::Tensor, at::Tensor, at::Tensor>
@@ -1021,6 +1288,89 @@ at::Tensor dequantize_weights_cuda(
     C10_CUDA_KERNEL_LAUNCH_CHECK();
   }
   return output;
+}
+
+
+std::tuple<at::Tensor, at::Tensor, at::Tensor, at::Tensor> mxfp8_stochastic_bf16_cuda(
+    const at::Tensor& values, int64_t seed, int64_t call_rows, int64_t call_cols, bool rows_wise, bool cols_wise) {
+  check_bf16_matrix(values, "values");
+  TORCH_CHECK(values.dim() == 2, "values must be 2D.");
+  c10::cuda::CUDAGuard device_guard(values.device());
+  check_blackwell();
+  const int64_t rows = values.size(0), cols = values.size(1);
+  TORCH_CHECK(rows % kMxBlock == 0 && cols % kMxBlock == 0, "both dims must be multiples of 32.");
+  const auto bytes = values.options().dtype(at::kByte);
+  auto rows_data = at::empty({rows_wise ? rows : 0, cols}, bytes);
+  auto rows_scales = at::empty({rows_wise ? rows : 0, cols / kMxBlock}, bytes);
+  auto cols_data = at::empty({cols_wise ? cols : 0, rows}, bytes);
+  auto cols_scales = at::empty({cols_wise ? cols : 0, rows / kMxBlock}, bytes);
+  const Bf16Source source{reinterpret_cast<const __nv_bfloat16*>(values.const_data_ptr()), rows, cols};
+  const SrOutputs out{byte_ptr(rows_data), byte_ptr(rows_scales), byte_ptr(cols_data), byte_ptr(cols_scales)};
+  if (rows_wise && cols_wise) {
+    launch_stochastic<Bf16Source, true, true>(source, out, 1, rows, cols, seed, call_rows, call_cols, values);
+  } else if (rows_wise) {
+    launch_stochastic<Bf16Source, true, false>(source, out, 1, rows, cols, seed, call_rows, call_cols, values);
+  } else if (cols_wise) {
+    launch_stochastic<Bf16Source, false, true>(source, out, 1, rows, cols, seed, call_rows, call_cols, values);
+  }
+  return {rows_data, rows_scales, cols_data, cols_scales};
+}
+
+std::tuple<at::Tensor, at::Tensor> mxfp8_stochastic_nvfp4_activations_cuda(
+    const at::Tensor& packed, const at::Tensor& block_scales, const at::Tensor& global_scales,
+    const at::Tensor& offsets, int64_t seed, int64_t call) {
+  check_quantized_tensors(packed, block_scales, global_scales);
+  TORCH_CHECK(packed.dim() == 2, "packed activations must be 2D.");
+  TORCH_CHECK(offsets.is_cuda() && offsets.scalar_type() == at::kInt && offsets.is_contiguous() && offsets.numel() > 0,
+              "offsets must be a non-empty contiguous CUDA int32 tensor.");
+  c10::cuda::CUDAGuard device_guard(packed.device());
+  check_blackwell();
+  const int64_t rows = packed.size(0), contraction = packed.size(1) * 2;
+  TORCH_CHECK(rows % kMxBlock == 0, "the token count must be a multiple of 32.");
+  TORCH_CHECK(contraction % kSfVectorSize == 0, "the contraction dim must be a multiple of 16.");
+  const int64_t scale_column_tiles = round_up(contraction / kSfVectorSize, kScaleColTile) / kScaleColTile;
+  const auto bytes = packed.options().dtype(at::kByte);
+  auto data = at::empty({contraction, rows}, bytes);
+  auto scales = at::empty({contraction, rows / kMxBlock}, bytes);
+  const NVFP4ActivationSource source{packed.const_data_ptr<uint8_t>(),
+                                     reinterpret_cast<const uint8_t*>(block_scales.data_ptr()),
+                                     global_scales.const_data_ptr<float>(),
+                                     offsets.const_data_ptr<int32_t>(),
+                                     static_cast<int>(offsets.numel()),
+                                     static_cast<int>(contraction),
+                                     static_cast<int>(scale_column_tiles)};
+  launch_stochastic<NVFP4ActivationSource, false, true>(source, SrOutputs{nullptr, nullptr, byte_ptr(data),
+                                                                          byte_ptr(scales)},
+                                                        1, rows, contraction, seed, call, call, packed);
+  return {data, scales};
+}
+
+std::tuple<at::Tensor, at::Tensor> mxfp8_stochastic_nvfp4_weights_cuda(
+    const at::Tensor& packed, const at::Tensor& block_scales, const at::Tensor& global_scales, int64_t seed,
+    int64_t call) {
+  check_quantized_tensors(packed, block_scales, global_scales);
+  TORCH_CHECK(packed.dim() == 3, "packed weights must be 3D.");
+  c10::cuda::CUDAGuard device_guard(packed.device());
+  check_blackwell();
+  const int64_t groups = packed.size(0), output_size = packed.size(1), contraction = packed.size(2) * 2;
+  TORCH_CHECK(output_size % kMxBlock == 0, "the weights' output dim must be a multiple of 32.");
+  TORCH_CHECK(contraction % kSfVectorSize == 0, "the contraction dim must be a multiple of 16.");
+  const int64_t output_row_tiles = round_up(output_size, kScaleRowTile) / kScaleRowTile;
+  const int64_t scale_column_tiles = round_up(contraction / kSfVectorSize, kScaleColTile) / kScaleColTile;
+  const auto bytes = packed.options().dtype(at::kByte);
+  auto data = at::empty({groups, contraction, output_size}, bytes);
+  auto scales = at::empty({groups, contraction, output_size / kMxBlock}, bytes);
+  const NVFP4WeightSource source{packed.const_data_ptr<uint8_t>(),
+                                 reinterpret_cast<const uint8_t*>(block_scales.data_ptr()),
+                                 global_scales.const_data_ptr<float>(),
+                                 static_cast<int>(output_size),
+                                 static_cast<int>(contraction),
+                                 static_cast<int>(output_row_tiles),
+                                 static_cast<int>(scale_column_tiles)};
+  launch_stochastic<NVFP4WeightSource, false, true>(source, SrOutputs{nullptr, nullptr, byte_ptr(data),
+                                                                      byte_ptr(scales)},
+                                                    groups, output_size, contraction, seed, call, call, packed);
+  return {data, scales};
 }
 
 } // namespace prime_kernels::nvfp4

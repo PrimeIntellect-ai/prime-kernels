@@ -111,11 +111,24 @@ def bench_shape(name: str, hidden: int, inter: int, experts: int, tokens: int, k
         result["c/bf16_gemm"] = timed(lambda: grouped(x, gate_up, offsets))
         if mxfp8 is not None:
             from prime_kernels.mxfp8_moe.grouped_gemm import _quantize_dim1, quantize_rows
-            from prime_kernels.nvfp4_moe.stochastic import quantize_columns_sr, quantize_rows_sr
+            from prime_kernels.nvfp4_moe import stochastic as sr
 
             grad_up = torch.randn(rows, 2 * inter, device="cuda", dtype=torch.bfloat16)
             result["c/grad_quant_nearest"] = timed(lambda: (quantize_rows(grad_up), _quantize_dim1(grad_up)))
-            result["c/grad_quant_stochastic"] = timed(lambda: (quantize_rows_sr(grad_up), quantize_columns_sr(grad_up)))
+            # The fused stochastic-rounding kernels against the PyTorch reference of the same bits
+            result["c/grad_quant_stochastic"] = timed(lambda: sr.quantize_grad(grad_up, 0, 1))
+            result["c/grad_quant_stochastic_torch"] = timed(
+                lambda: (sr.reference_rows(grad_up, 0), sr.reference_columns(grad_up, 1))
+            )
+            result["c/operand_requant_stochastic"] = timed(
+                lambda: (sr.quantize_activation_columns(qx, 2), sr.quantize_weight_for_dgrad(qw, 3))
+            )
+            result["c/operand_requant_stochastic_torch"] = timed(
+                lambda: (
+                    sr.reference_columns(qx.dequantize(), 2),
+                    sr.reference_rows(qw.dequantize().contiguous(), 3),
+                )
+            )
     return result
 
 

@@ -103,3 +103,35 @@ _dequantize_weights = torch.ops.prime_rl.dequantize_nvfp4_weights.default
 
 torch.library.register_fake("prime_rl::grouped_nvfp4_gemm", _grouped_mm_fake)
 _grouped_mm = torch.ops.prime_rl.grouped_nvfp4_gemm.default
+
+
+def _mxfp8_stochastic_bf16_fake(values, seed, call_rows, call_cols, rows_wise, cols_wise):
+    del seed, call_rows, call_cols
+    rows, cols = values.shape
+    empty = lambda *shape: values.new_empty(shape, dtype=torch.uint8)  # noqa: E731
+    return (
+        empty(rows if rows_wise else 0, cols),
+        empty(rows if rows_wise else 0, cols // 32),
+        empty(cols if cols_wise else 0, rows),
+        empty(cols if cols_wise else 0, rows // 32),
+    )
+
+
+def _mxfp8_stochastic_nvfp4_activations_fake(packed, block_scales, global_scales, offsets, seed, call):
+    del block_scales, global_scales, offsets, seed, call
+    rows, contraction = packed.shape[0], packed.shape[1] * 2
+    return packed.new_empty((contraction, rows)), packed.new_empty((contraction, rows // 32))
+
+
+def _mxfp8_stochastic_nvfp4_weights_fake(packed, block_scales, global_scales, seed, call):
+    del block_scales, global_scales, seed, call
+    groups, output_size, contraction = packed.shape[0], packed.shape[1], packed.shape[2] * 2
+    return (
+        packed.new_empty((groups, contraction, output_size)),
+        packed.new_empty((groups, contraction, output_size // 32)),
+    )
+
+
+torch.library.register_fake("prime_rl::mxfp8_stochastic_bf16", _mxfp8_stochastic_bf16_fake)
+torch.library.register_fake("prime_rl::mxfp8_stochastic_nvfp4_activations", _mxfp8_stochastic_nvfp4_activations_fake)
+torch.library.register_fake("prime_rl::mxfp8_stochastic_nvfp4_weights", _mxfp8_stochastic_nvfp4_weights_fake)

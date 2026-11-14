@@ -80,19 +80,24 @@ class _GroupedNVFP4MM(torch.autograd.Function):
             triton_mx_block_rearrange_per_group_3d,
         )
 
-        from .stochastic import quantize_columns_sr, quantize_rows_sr
+        from . import stochastic
 
         matrix_data, matrix_scales, matrix_global, weight_data, weight_scales, weight_global, offsets = ctx.saved_tensors
-        grad_output = grad_output.contiguous().bfloat16()
+        # The operands' call numbers, claimed whichever gradients are needed so a step always draws the same bits
+        call = stochastic.next_calls(4)
+        need_matrix, need_weight = ctx.needs_input_grad[0], ctx.needs_input_grad[1]
+        grad_rows, grad_cols = stochastic.quantize_grad(
+            grad_output.contiguous().bfloat16(), call + 1, call + 2, rows=need_matrix, cols=need_weight
+        )
         grad_matrix = grad_weight = None
-        if ctx.needs_input_grad[0]:
-            weight = _NVFP4Tensor(weight_data, weight_scales, weight_global, None).dequantize()
-            data, scales = quantize_rows_sr(weight.contiguous())
+        if need_matrix:
+            weight = _NVFP4Tensor(weight_data, weight_scales, weight_global, None)
+            data, scales = stochastic.quantize_weight_for_dgrad(weight, call)
             quantized_weight = (data.transpose(-2, -1), triton_mx_block_rearrange_per_group_3d(scales))
-            grad_matrix = _dgrad(grad_output, weight, offsets, quantized_weight, quantize_rows_sr(grad_output))
-        if ctx.needs_input_grad[1]:
-            matrix = _NVFP4Tensor(matrix_data, matrix_scales, matrix_global, offsets).dequantize()
-            grad_weight = _wgrad_quantized(quantize_columns_sr(grad_output), quantize_columns_sr(matrix), offsets)
+            grad_matrix = _dgrad(grad_output, None, offsets, quantized_weight, grad_rows)
+        if need_weight:
+            matrix = _NVFP4Tensor(matrix_data, matrix_scales, matrix_global, offsets)
+            grad_weight = _wgrad_quantized(grad_cols, stochastic.quantize_activation_columns(matrix, call + 3), offsets)
         return grad_matrix, grad_weight, None, None, None
 
 
