@@ -10,4 +10,5 @@ dependencies = ["torch>=2.9.0"]
 
 [build-system]
 requires = ["setuptools>=77", "wheel", "ninja", "torch>=2.9.0"]
-build-backend = "setuptools.build_meta"
+build-backend = "build_backend"
+backend-path = ["."]
