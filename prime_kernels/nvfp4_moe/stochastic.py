@@ -31,6 +31,11 @@ def set_seed(seed: int) -> None:
     _seed, _calls = seed, 0
 
 
+def seed() -> int:
+    """The seed ``set_seed`` set for this step."""
+    return _seed
+
+
 def next_calls(count: int) -> int:
     """Claim ``count`` consecutive call numbers; returns the first."""
     global _calls

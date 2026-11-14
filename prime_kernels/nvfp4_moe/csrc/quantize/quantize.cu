@@ -49,18 +49,6 @@ __host__ __device__ __forceinline__ int64_t round_up(
   return ((value + multiple - 1) / multiple) * multiple;
 }
 
-void check_sm100() {
-  const auto* properties =
-      at::cuda::getDeviceProperties(at::cuda::current_device());
-  TORCH_CHECK(
-      properties->major == 10 && properties->minor == 0,
-      "prime-rl-kernels NVFP4 quantization requires SM100, but the current "
-      "device is SM",
-      properties->major,
-      properties->minor,
-      ".");
-}
-
 void check_bf16_matrix(const at::Tensor& tensor, const char* name) {
   TORCH_CHECK(tensor.is_cuda(), name, " must be a CUDA tensor.");
   TORCH_CHECK(tensor.scalar_type() == at::kBFloat16, name, " must be BF16.");
@@ -993,7 +981,7 @@ __global__ void mxfp8_stochastic_kernel(Source source, SrOutputs out, int rows, 
 void check_blackwell() {
   const auto* properties = at::cuda::getDeviceProperties(at::cuda::current_device());
   TORCH_CHECK(properties->major == 10 && (properties->minor == 0 || properties->minor == 3),
-              "MXFP8 stochastic quantization requires SM100 or SM103, but the current device is SM",
+              "prime-kernels NVFP4/MXFP8 quantization requires SM100 or SM103, but the current device is SM",
               properties->major, properties->minor, ".");
 }
 
@@ -1037,7 +1025,7 @@ quantize_activations_cuda(
       "matrix and offsets must be on the same device.");
 
   c10::cuda::CUDAGuard device_guard(matrix.device());
-  check_sm100();
+  check_blackwell();
 
   const int64_t rows = matrix.size(0);
   const int64_t contraction_size = matrix.size(1);
@@ -1109,7 +1097,7 @@ quantize_weights_cuda(const at::Tensor& weight_rows) {
       "weight_rows' contraction dimension must be a positive multiple of 32.");
 
   c10::cuda::CUDAGuard device_guard(weight_rows.device());
-  check_sm100();
+  check_blackwell();
 
   const int64_t groups = weight_rows.size(0);
   const int64_t output_size = weight_rows.size(1);
@@ -1194,7 +1182,7 @@ at::Tensor dequantize_activations_cuda(
       "same device.");
 
   c10::cuda::CUDAGuard device_guard(packed.device());
-  check_sm100();
+  check_blackwell();
 
   const int64_t rows = packed.size(0);
   const int64_t contraction_size = packed.size(1) * 2;
@@ -1245,7 +1233,7 @@ at::Tensor dequantize_weights_cuda(
       "weight global_scales must contain one value per expert.");
 
   c10::cuda::CUDAGuard device_guard(packed.device());
-  check_sm100();
+  check_blackwell();
 
   const int64_t groups = packed.size(0);
   const int64_t output_size = packed.size(1);
