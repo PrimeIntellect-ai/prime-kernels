@@ -5,26 +5,24 @@ block-16 E4M3 scales. Activations have one FP32 outer scale per token; weights
 have one per expert. Gated experts must pass a fused gate/up weight to share
 the outer weight scale.
 
-`grouped_gemm(x, weight_t, offs=offsets, backward="dequant_bf16")` accepts
-`x[M, K]`, `weight_t[E, K, N]`, and cumulative INT32 row offsets. The token
-dispatcher aligns expert row counts to `TOKEN_GROUP_ALIGNMENT`. Expert hidden
-and intermediate dimensions must be positive multiples of 32.
+`grouped_gemm(x, weight_t, offs=offsets)` accepts `x[M, K]`, `weight_t[E, K, N]`, and cumulative INT32 row offsets.
+The token dispatcher aligns expert row counts to `TOKEN_GROUP_ALIGNMENT`. Expert hidden and intermediate dimensions
+must be positive multiples of 32.
 
-The default backward reconstructs the packed forward operands and computes
-BF16 dgrad and wgrad. `backward="bf16"` uses the original BF16 operands.
-Master parameters and optimizer precision are controlled by the trainer.
-Use `fullgraph=False` with the trainer.
+One recipe, after Thinking Machines' end-to-end 4-bit training:
 
-`four_over_six=True` enables adaptive map-to-4/map-to-6 scaling for both
-operands, matching FlashInfer's default 4/6 recipe: E4M3 normalization bound
-448, MAE error selection, strict error scoring, and the default approximate
-candidate arithmetic. The option defaults to `False`. The same option is
-available on `quantize_activations` and `quantize_weights`.
+- Forward: NVFP4 (E2M1, 1x16 blocks, E4M3 block scales, FP32 outer scale). Activations, both GEMM inputs, take a
+  per-token outer scale and choose each block's scale with 4/6 (the lower-error of the max-6 and max-4 scales);
+  weights take a per-expert outer scale and never 4/6. All quantizer arithmetic is IEEE (no approximate
+  reciprocals).
+- Backward: dgrad and wgrad in MXFP8 (E4M3, E8M0 scales per 32 elements) on the dequantized NVFP4 forward operands,
+  so the gradients see the forward's rounding. The operands and the output gradient are quantized with stochastic
+  rounding (`stochastic.py`), seeded by `stochastic.set_seed`: call it once per training step and a step reproduces
+  the same bits.
 
-On inference, enable `FLASHINFER_NVFP4_4OVER6=1` and leave the other FlashInfer
-NVFP4 options at their defaults. Changing the normalization bound, error metric,
-error-scoring mode, or `FLASHINFER_DISABLE_FP4_QUANT_FAST_MATH` would select a
-different recipe. The quantized layout and backward operands are unchanged.
+Weights quantized ahead of the GEMM (`quantize_expert_weight`, e.g. per FSDP shard for a quantized all-gather) and
+tokens quantized before dispatch (`dispatch.py`) give the same bytes as quantizing inside the GEMM. Master parameters
+and optimizer precision are controlled by the trainer. Use `fullgraph=False` with the trainer.
 
 Build with a CUDA development toolkit matching PyTorch's CUDA major.
 Kernel-specific dependencies are declared in `kernels.toml` under

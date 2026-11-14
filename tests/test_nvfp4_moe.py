@@ -24,16 +24,19 @@ def decode_rows(data, scales, global_scales, rows, k):
     return (fp4 * multiplier.repeat_interleave(16, dim=-1)).bfloat16()
 
 
+def relative_rms(actual, expected):
+    return ((actual.float() - expected.float()).square().mean() / expected.float().square().mean()).sqrt().item()
+
+
 @pytest.mark.parametrize("k,n", [(64, 96), (2048, 1536), (2688, 3712)])
-@pytest.mark.parametrize("four_over_six", [False, True])
-def test_nvfp4_forward_and_backward_operands(kernel, k, n, four_over_six):
+def test_nvfp4_forward_and_backward(kernel, k, n):
     torch.manual_seed(1729)
     counts = [32, 0, 64]
     offsets = torch.tensor(counts, device="cuda", dtype=torch.int32).cumsum(0, dtype=torch.int32)
     x = (torch.randn(sum(counts), k, device="cuda") * 0.2).bfloat16().requires_grad_()
     w = (torch.randn(3, n, k, device="cuda") * 0.2).bfloat16().transpose(-1, -2).requires_grad_()
-    qx = kernel.quantize_activations(x, offsets, four_over_six=four_over_six)
-    qw = kernel.quantize_weights(w, four_over_six=four_over_six)
+    qx = kernel.quantize_activations(x, offsets)
+    qw = kernel.quantize_weights(w)
     dx, dw = qx.dequantize(), qw.dequantize()
     scale_cols = ((k // 16 + 3) // 4) * 4
     row_start = scale_start = 0
@@ -52,41 +55,28 @@ def test_nvfp4_forward_and_backward_operands(kernel, k, n, four_over_six):
     for expert in range(3):
         reference = decode_rows(qw.data[expert], qw.block_scales[expert], qw.global_scales[expert], n, k)
         torch.testing.assert_close(dw[expert].T, reference, rtol=0, atol=0)
+
     reference = F.grouped_mm(dx, dw, offs=offsets, out_dtype=torch.bfloat16)
     grad = torch.randn_like(reference)
-    for backward in ("dequant_bf16", "bf16"):
-        x.grad = w.grad = None
-        y = kernel.grouped_gemm(x, w, offs=offsets, backward=backward, four_over_six=four_over_six)
-        relative_rms = ((y.float() - reference.float()).square().mean() / reference.float().square().mean()).sqrt()
-        assert relative_rms < 0.01, relative_rms.item()
-        y.backward(grad)
-        operands = (dx, dw) if backward == "dequant_bf16" else (x, w)
-        expected_dx = F.grouped_mm(grad, operands[1].transpose(-1, -2), offs=offsets, out_dtype=torch.bfloat16)
-        expected_dw = F.grouped_mm(operands[0].T, grad, offs=offsets, out_dtype=torch.bfloat16)
-        torch.testing.assert_close(x.grad, expected_dx, rtol=0, atol=0)
-        torch.testing.assert_close(w.grad, expected_dw, rtol=0, atol=0)
-
-    # MXFP8 gradient GEMMs on the dequantized operands approximate the dequantized BF16 gradients
-    x.grad = w.grad = None
-    kernel.grouped_gemm(x, w, offs=offsets, backward="dequant_mxfp8", four_over_six=four_over_six).backward(grad)
+    kernel.stochastic.set_seed(0)
+    y = kernel.grouped_gemm(x, w, offs=offsets)
+    assert relative_rms(y, reference) < 0.01
+    y.backward(grad)
+    # MXFP8 gradient GEMMs on the dequantized operands approximate their BF16 gradients
     expected_dx = F.grouped_mm(grad, dw.transpose(-1, -2), offs=offsets, out_dtype=torch.bfloat16)
     expected_dw = F.grouped_mm(dx.T, grad, offs=offsets, out_dtype=torch.bfloat16)
-    for actual, expected in ((x.grad, expected_dx), (w.grad, expected_dw)):
-        error = ((actual.float() - expected.float()).square().mean() / expected.float().square().mean()).sqrt()
-        assert error < 0.05, error.item()
+    assert relative_rms(x.grad, expected_dx) < 0.05 and relative_rms(w.grad, expected_dw) < 0.05
 
-    # MXFP8 gradient GEMMs approximate the BF16 gradients on the original operands
-    x.grad = w.grad = None
-    kernel.grouped_gemm(x, w, offs=offsets, backward="mxfp8", four_over_six=four_over_six).backward(grad)
-    expected_dx = F.grouped_mm(grad, w.transpose(-1, -2), offs=offsets, out_dtype=torch.bfloat16)
-    expected_dw = F.grouped_mm(x.T, grad, offs=offsets, out_dtype=torch.bfloat16)
-    for actual, expected in ((x.grad, expected_dx), (w.grad, expected_dw)):
-        error = ((actual.float() - expected.float()).square().mean() / expected.float().square().mean()).sqrt()
-        assert error < 0.05, error.item()
+    # Stochastic rounding is seeded: the same seed gives the same bits, another seed other ones
+    first = (x.grad.clone(), w.grad.clone())
+    for seed, same in ((0, True), (1, False)):
+        x.grad = w.grad = None
+        kernel.stochastic.set_seed(seed)
+        kernel.grouped_gemm(x, w, offs=offsets).backward(grad)
+        assert (torch.equal(x.grad, first[0]) and torch.equal(w.grad, first[1])) == same
 
 
-@pytest.mark.parametrize("backward", ["mxfp8", "dequant_mxfp8", "dequant_bf16"])
-def test_pre_quantized_shards_match_the_bf16_weight(kernel, backward):
+def test_pre_quantized_shards_match_the_bf16_weight(kernel):
     """FSDP's quantized all-gather: each rank quantizes its whole-expert shard, the pieces concatenate along the
     expert dimension, and the GEMM on them matches the GEMM on the BF16 weight bit for bit."""
     from prime_kernels.nvfp4_moe.grouped_gemm import QuantizedExpertWeight, quantize_expert_weight
@@ -99,30 +89,31 @@ def test_pre_quantized_shards_match_the_bf16_weight(kernel, backward):
     w = rows.transpose(-1, -2).requires_grad_()
     grad = torch.randn(sum(counts), n, device="cuda", dtype=torch.bfloat16)
 
-    y = kernel.grouped_gemm(x, w, offs=offsets, backward=backward, four_over_six=True)
+    kernel.stochastic.set_seed(0)
+    y = kernel.grouped_gemm(x, w, offs=offsets)
     y.backward(grad)
     expected = (y.detach(), x.grad.clone(), w.grad.clone())
 
-    shards = [quantize_expert_weight(rows[i : i + 2], four_over_six=True, backward=backward) for i in (0, 2)]
+    shards = [quantize_expert_weight(rows[i : i + 2]) for i in (0, 2)]
     gathered = QuantizedExpertWeight.from_tensors(
         tuple(torch.cat(parts) for parts in zip(*(shard.tensors() for shard in shards)))
     )
     x.grad = w.grad = None
-    y = kernel.grouped_gemm(x, w, offs=offsets, backward=backward, four_over_six=True, weight_quantized=gathered)
+    kernel.stochastic.set_seed(0)
+    y = kernel.grouped_gemm(x, w, offs=offsets, weight_quantized=gathered)
     y.backward(grad)
     for actual, wanted in zip((y.detach(), x.grad, w.grad), expected):
         torch.testing.assert_close(actual, wanted, rtol=0, atol=0)
 
 
-@pytest.mark.parametrize("four_over_six", [False, True])
-def test_nvfp4_token_locality_and_zero_rows(kernel, four_over_six):
+def test_nvfp4_token_locality_and_zero_rows(kernel):
     torch.manual_seed(41)
     x = torch.randn(64, 256, device="cuda", dtype=torch.bfloat16)
     x[0] = 0
     offsets = torch.tensor([32, 64], device="cuda", dtype=torch.int32)
-    first = kernel.quantize_activations(x, offsets, four_over_six=four_over_six)
+    first = kernel.quantize_activations(x, offsets)
     x[1] *= 1024
-    second = kernel.quantize_activations(x, offsets, four_over_six=four_over_six)
+    second = kernel.quantize_activations(x, offsets)
     keep = torch.arange(64, device="cuda") != 1
     assert torch.equal(first.data.view(torch.uint8)[keep], second.data.view(torch.uint8)[keep])
     assert torch.equal(first.global_scales[keep], second.global_scales[keep])
@@ -132,7 +123,6 @@ def test_nvfp4_token_locality_and_zero_rows(kernel, four_over_six):
         x[:0],
         torch.zeros(2, 256, 256, device="cuda", dtype=torch.bfloat16),
         offs=torch.zeros(2, device="cuda", dtype=torch.int32),
-        four_over_six=four_over_six,
     )
     assert empty.shape == (0, 256)
 
@@ -148,9 +138,10 @@ def test_mxfp8_backward_keeps_rl_sized_gradients(kernel, grad_scale):
     x = (torch.randn(sum(counts), k, device="cuda") * 0.2).bfloat16().requires_grad_()
     w = (torch.randn(2, n, k, device="cuda") * 0.02).bfloat16().transpose(-1, -2).requires_grad_()
     grad = (torch.randn(sum(counts), n, device="cuda") * grad_scale).bfloat16()
-    kernel.grouped_gemm(x, w, offs=offsets, backward="mxfp8", four_over_six=True).backward(grad)
-    expected_dx = F.grouped_mm(grad.float(), w.float().transpose(-1, -2), offs=offsets)
-    expected_dw = F.grouped_mm(x.float().T, grad.float(), offs=offsets)
+    kernel.grouped_gemm(x, w, offs=offsets).backward(grad)
+    dx = kernel.quantize_activations(x.detach(), offsets).dequantize().float()
+    dw = kernel.quantize_weights(w.detach()).dequantize().float()
+    expected_dx = F.grouped_mm(grad.float(), dw.transpose(-1, -2), offs=offsets)
+    expected_dw = F.grouped_mm(dx.T, grad.float(), offs=offsets)
     for actual, expected in ((x.grad, expected_dx), (w.grad, expected_dw)):
-        error = ((actual.float() - expected).square().mean() / expected.square().mean()).sqrt()
-        assert error < 0.05, (grad_scale, error.item())
+        assert relative_rms(actual, expected) < 0.05, grad_scale

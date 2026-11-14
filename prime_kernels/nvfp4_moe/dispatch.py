@@ -90,11 +90,11 @@ def swizzle_scales(block_scales: torch.Tensor, offsets: torch.Tensor, contractio
     return out.view(block_scales.dtype).view(padded_rows, scale_columns)
 
 
-def quantize_tokens(x: torch.Tensor, *, four_over_six: bool = False, exact_division: bool = False) -> NVFP4Tokens:
+def quantize_tokens(x: torch.Tensor) -> NVFP4Tokens:
     """Quantize ``[M, K]`` tokens before dispatch: the same bytes ``quantize_activations`` gives each row after it."""
     rows, contraction_size = x.shape
     one_group = torch.tensor([rows], device=x.device, dtype=torch.int32)
-    quantized = quantize_activations(x, one_group, four_over_six=four_over_six, exact_division=exact_division)
+    quantized = quantize_activations(x, one_group)
     scales = unswizzle_scales(quantized.block_scales, one_group, rows, contraction_size)
     return NVFP4Tokens(quantized.data.view(torch.uint8), scales, quantized.global_scales)
 

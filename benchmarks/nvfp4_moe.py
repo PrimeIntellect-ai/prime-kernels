@@ -5,10 +5,11 @@ For each model shape and tokens per expert, one expert layer (gate_up then down 
 backward with:
 - ``bf16``: torch grouped GEMMs;
 - ``mxfp8``: prime-kernels' mxfp8_moe;
-- ``nvfp4/<backward>``: nvfp4_moe with each backward, quantizing the weights in the GEMM or receiving them
-  pre-quantized (as FSDP's quantized all-gather would).
+- ``nvfp4``: nvfp4_moe (NVFP4 forward, MXFP8 backward with stochastic rounding on the dequantized operands),
+  quantizing the weights in the GEMM or receiving them pre-quantized (as FSDP's quantized all-gather would).
 
-Components (quantizers, the NVFP4 GEMM, one- vs two-pass gradient quantization) show where the time goes.
+Components (quantizers, the NVFP4 GEMM, the stochastic-rounding MXFP8 quantizer against round-to-nearest) show
+where the time goes.
 
     python benchmarks/nvfp4_moe.py --json results.json
 """
@@ -78,34 +79,22 @@ def bench_shape(name: str, hidden: int, inter: int, experts: int, tokens: int, k
         result["mxfp8"] = timed(layer(lambda a, w, o: mxfp8.grouped_gemm(a, w, o), x, gate_up, down, offsets, grad))
     from prime_kernels.nvfp4_moe.grouped_gemm import quantize_expert_weight
 
-    for backward in ("mxfp8", "dequant_bf16", "bf16"):
-        for prequantized in (False, True) if backward != "bf16" else (False,):
-            # Pre-quantized: what FSDP's quantized all-gather hands the GEMM (weights quantized once per gather,
-            # reused by every GEMM on them)
-            quantized = {
-                id(w): quantize_expert_weight(w.detach().transpose(-2, -1), four_over_six=True, backward=backward)
-                for w in (gate_up, down)
-            }
+    # Pre-quantized: what FSDP's quantized all-gather hands the GEMM (weights quantized once per gather, reused by
+    # every GEMM on them)
+    quantized = {id(w): quantize_expert_weight(w.detach().transpose(-2, -1)) for w in (gate_up, down)}
+    for prequantized in (False, True):
 
-            def gemm(a, w, o, backward=backward, prequantized=prequantized, quantized=quantized):
-                return nvfp4.grouped_gemm(
-                    a,
-                    w,
-                    offs=o,
-                    backward=backward,
-                    four_over_six=True,
-                    weight_quantized=quantized[id(w)] if prequantized else None,
-                )
+        def gemm(a, w, o, prequantized=prequantized):
+            return nvfp4.grouped_gemm(a, w, offs=o, weight_quantized=quantized[id(w)] if prequantized else None)
 
-            label = f"nvfp4/{backward}" + ("+prequantized" if prequantized else "")
-            result[label] = timed(layer(gemm, x, gate_up, down, offsets, grad))
+        result["nvfp4" + ("+prequantized" if prequantized else "")] = timed(layer(gemm, x, gate_up, down, offsets, grad))
 
     # Components on the gate_up projection
     with torch.no_grad():
-        result["c/quantize_activations"] = timed(lambda: nvfp4.quantize_activations(x, offsets, four_over_six=True))
-        result["c/quantize_weights"] = timed(lambda: nvfp4.quantize_weights(gate_up, four_over_six=True))
-        qx = nvfp4.quantize_activations(x, offsets, four_over_six=True)
-        qw = nvfp4.quantize_weights(gate_up, four_over_six=True)
+        result["c/quantize_activations"] = timed(lambda: nvfp4.quantize_activations(x, offsets))
+        result["c/quantize_weights"] = timed(lambda: nvfp4.quantize_weights(gate_up))
+        qx = nvfp4.quantize_activations(x, offsets)
+        qw = nvfp4.quantize_weights(gate_up)
         from prime_kernels.nvfp4_moe._ops import _grouped_mm
 
         result["c/nvfp4_gemm"] = timed(
@@ -121,17 +110,12 @@ def bench_shape(name: str, hidden: int, inter: int, experts: int, tokens: int, k
         )
         result["c/bf16_gemm"] = timed(lambda: grouped(x, gate_up, offsets))
         if mxfp8 is not None:
-            from prime_kernels.mxfp8_moe.grouped_gemm import (
-                _dgrad_weight,
-                _quantize_dim1,
-                quantize_grad,
-                quantize_rows,
-            )
+            from prime_kernels.mxfp8_moe.grouped_gemm import _quantize_dim1, quantize_rows
+            from prime_kernels.nvfp4_moe.stochastic import quantize_columns_sr, quantize_rows_sr
 
             grad_up = torch.randn(rows, 2 * inter, device="cuda", dtype=torch.bfloat16)
-            result["c/mxfp8_dgrad_weight"] = timed(lambda: _dgrad_weight(gate_up))
-            result["c/grad_quant_two_pass"] = timed(lambda: (quantize_rows(grad_up), _quantize_dim1(grad_up)))
-            result["c/grad_quant_one_pass"] = timed(lambda: quantize_grad(grad_up))
+            result["c/grad_quant_nearest"] = timed(lambda: (quantize_rows(grad_up), _quantize_dim1(grad_up)))
+            result["c/grad_quant_stochastic"] = timed(lambda: (quantize_rows_sr(grad_up), quantize_columns_sr(grad_up)))
     return result
 
 

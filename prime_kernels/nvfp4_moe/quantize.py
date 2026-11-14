@@ -62,15 +62,9 @@ def _check_bf16_cuda(tensor: torch.Tensor, name: str) -> None:
 def quantize_activations(
     matrix: torch.Tensor,
     offsets: torch.Tensor,
-    *,
-    four_over_six: bool = False,
-    exact_division: bool = False,
-    static_scale: bool = False,
 ) -> _NVFP4Tensor:
-    """Quantize ``[M, K]`` activations with one FP32 decode scale per token. ``exact_division`` uses IEEE-rounded
-    reciprocals in the block math instead of FlashInfer's approximate ones (what vLLM's NVFP4 engines use).
-    ``static_scale`` fixes every token's global decode scale at 1.0 instead of its amax / 2688: how vLLM's online NVFP4
-    engines (TRTLLM) quantize the down projection's input."""
+    """Quantize ``[M, K]`` activations with one FP32 decode scale per token, choosing each block's scale with 4/6 (the
+    lower-error of the max-6 and max-4 scales), in IEEE arithmetic."""
 
     _check_blackwell()
     if matrix.ndim != 2:
@@ -85,13 +79,7 @@ def quantize_activations(
     if not offsets.is_contiguous():
         offsets = offsets.contiguous()
 
-    packed, block_scales, global_scales = _quantize_activations_kernel(
-        matrix,
-        offsets,
-        four_over_six,
-        exact_division,
-        static_scale,
-    )
+    packed, block_scales, global_scales = _quantize_activations_kernel(matrix, offsets)
     return _NVFP4Tensor(
         data=packed.view(torch.float4_e2m1fn_x2),
         block_scales=block_scales,
@@ -100,8 +88,8 @@ def quantize_activations(
     )
 
 
-def quantize_weights(weight: torch.Tensor, *, four_over_six: bool = False, exact_division: bool = False) -> _NVFP4Tensor:
-    """Quantize logical ``[G, K, N]`` weights with one FP32 decode scale per expert."""
+def quantize_weights(weight: torch.Tensor) -> _NVFP4Tensor:
+    """Quantize logical ``[G, K, N]`` weights with one FP32 decode scale per expert (no 4/6), in IEEE arithmetic."""
 
     _check_blackwell()
     if weight.ndim != 3:
@@ -117,11 +105,7 @@ def quantize_weights(weight: torch.Tensor, *, four_over_six: bool = False, exact
     weight_rows = weight.transpose(-2, -1)
     if not weight_rows.is_contiguous():
         weight_rows = weight_rows.contiguous()
-    packed, block_scales, global_scales = _quantize_weights_kernel(
-        weight_rows,
-        four_over_six,
-        exact_division,
-    )
+    packed, block_scales, global_scales = _quantize_weights_kernel(weight_rows)
     return _NVFP4Tensor(
         data=packed.view(torch.float4_e2m1fn_x2),
         block_scales=block_scales,

@@ -182,8 +182,18 @@ def _wgrad(
         )
         return grad_weight.transpose(-2, -1)
 
-    grad_data, grad_scales = quantized_grad or _quantize_dim1(grad_output)
-    input_data, input_scales = _quantize_dim1(input_act)
+    return _wgrad_quantized(quantized_grad or _quantize_dim1(grad_output), _quantize_dim1(input_act), offsets)
+
+
+def _wgrad_quantized(
+    quantized_grad: tuple[torch.Tensor, torch.Tensor],
+    quantized_input: tuple[torch.Tensor, torch.Tensor],
+    offsets: torch.Tensor,
+) -> torch.Tensor:
+    """The weight gradient from the output gradient and the input quantized along the token dim (`_quantize_dim1`'s
+    layout: values `[N, M]` and scales `[N, M // 32]`)."""
+    grad_data, grad_scales = quantized_grad
+    input_data, input_scales = quantized_input
     scale_offsets = offsets // TOKEN_GROUP_ALIGNMENT
     grad_weight = torch._scaled_grouped_mm(
         grad_data,

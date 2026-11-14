@@ -1,4 +1,5 @@
 from . import _C  # noqa: F401
+from . import stochastic
 from .grouped_gemm import QuantizedExpertWeight, grouped_gemm, quantize_expert_weight
 from .quantize import quantize_activations, quantize_weights
 
@@ -9,6 +10,7 @@ __all__ = [
     "quantize_expert_weight",
     "quantize_activations",
     "quantize_weights",
+    "stochastic",
     "unsupported_shape_reason",
 ]
 

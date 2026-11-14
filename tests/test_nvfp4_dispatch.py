@@ -33,8 +33,7 @@ def test_scale_swizzle_matches_the_gemm_layout_and_round_trips(counts, k):
     not torch.cuda.is_available() or torch.cuda.get_device_capability() not in ((10, 0), (10, 3)),
     reason="NVFP4 quantization needs SM100/SM103",
 )
-@pytest.mark.parametrize("four_over_six", [False, True])
-def test_quantizing_before_dispatch_gives_the_same_bytes(four_over_six):
+def test_quantizing_before_dispatch_gives_the_same_bytes():
     import prime_kernels
 
     kernel = prime_kernels.load("nvfp4_moe")
@@ -47,14 +46,14 @@ def test_quantizing_before_dispatch_gives_the_same_bytes(four_over_six):
     counts = torch.bincount(route, minlength=experts)
     offsets = counts.cumsum(0, dtype=torch.int32)
 
-    after = kernel.quantize_activations(x[rows], offsets, four_over_six=four_over_six)
-    before = group_tokens(quantize_tokens(x, four_over_six=four_over_six).index_select(rows), offsets)
+    after = kernel.quantize_activations(x[rows], offsets)
+    before = group_tokens(quantize_tokens(x).index_select(rows), offsets)
     assert torch.equal(before.data.view(torch.uint8), after.data.view(torch.uint8))
     assert torch.equal(before.global_scales, after.global_scales)
     valid = unswizzle_scales(after.block_scales, offsets, rows.numel(), k)
     assert torch.equal(unswizzle_scales(before.block_scales, offsets, rows.numel(), k).view(torch.uint8), valid.view(torch.uint8))
 
     w = (torch.randn(experts, n, k, device="cuda") * 0.02).bfloat16().transpose(-1, -2)
-    expected = kernel.grouped_gemm(x[rows], w, offs=offsets, four_over_six=four_over_six)
-    actual = kernel.grouped_gemm(x[rows], w, offs=offsets, four_over_six=four_over_six, activations=before)
+    expected = kernel.grouped_gemm(x[rows], w, offs=offsets)
+    actual = kernel.grouped_gemm(x[rows], w, offs=offsets, activations=before)
     torch.testing.assert_close(actual, expected, rtol=0, atol=0)
