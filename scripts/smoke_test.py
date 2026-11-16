@@ -34,6 +34,23 @@ def smoke_prime_kernels():
     flash_moe = prime_kernels.load("flash_moe")
     print("flash_moe loaded:", flash_moe)
 
+    if CAP not in ((10, 0), (10, 3)):
+        print(f"nvfp4_moe is built for sm_100a/sm_103a; skipping on {CAP_STR}")
+        return
+    assert status.get("nvfp4_moe") == "available", status
+    nvfp4_moe = prime_kernels.load("nvfp4_moe")
+    # Two experts, 32 tokens each: one grouped NVFP4 forward and its BF16 backward
+    x = torch.randn(64, 128, device="cuda", dtype=torch.bfloat16, requires_grad=True)
+    weight = torch.randn(2, 128, 256, device="cuda", dtype=torch.bfloat16, requires_grad=True)
+    offsets = torch.tensor([32, 64], device="cuda", dtype=torch.int32)
+    out = nvfp4_moe.grouped_gemm(x, weight, offs=offsets, four_over_six=True)
+    out.float().sum().backward()
+    torch.cuda.synchronize()
+    reference = torch.cat([x[:32] @ weight[0], x[32:] @ weight[1]]).float()
+    error = (out.float() - reference).norm() / reference.norm()
+    assert out.shape == (64, 256) and torch.isfinite(out).all() and error < 0.25, error
+    print(f"nvfp4_moe grouped GEMM ran (relative error {error:.3f} vs BF16)")
+
 
 def smoke_deep_select():
     import deep_select

@@ -1,0 +1,23 @@
+from . import _C  # noqa: F401
+from . import stochastic
+from .grouped_gemm import QuantizedExpertWeight, grouped_gemm, quantize_expert_weight
+from .quantize import quantize_activations, quantize_weights
+
+__all__ = [
+    "TOKEN_GROUP_ALIGNMENT",
+    "QuantizedExpertWeight",
+    "grouped_gemm",
+    "quantize_expert_weight",
+    "quantize_activations",
+    "quantize_weights",
+    "stochastic",
+    "unsupported_shape_reason",
+]
+
+TOKEN_GROUP_ALIGNMENT = 32
+
+
+def unsupported_shape_reason(dim: int, hidden_dim: int) -> str | None:
+    if dim <= 0 or hidden_dim <= 0 or dim % 32 or hidden_dim % 32:
+        return "NVFP4 expert dimensions must be positive multiples of 32"
+    return None

@@ -121,6 +121,10 @@ jobs:
           echo "Building against torch==${{ env.TORCH_VERSION }}"
           uv venv --python 3.12 /tmp/build-env
           VIRTUAL_ENV=/tmp/build-env uv pip install "torch==${{ env.TORCH_VERSION }}" setuptools wheel ninja cmake
+          # Kernels' own build dependencies (e.g. CUTLASS headers for nvfp4_moe), from kernels.toml: the
+          # --no-build-isolation build below does not install them.
+          BUILD_REQUIRES=$(/tmp/build-env/bin/python -c 'import build_backend; print(" ".join(build_backend.get_requires_for_build_wheel()))')
+          if [ -n "$BUILD_REQUIRES" ]; then VIRTUAL_ENV=/tmp/build-env uv pip install $BUILD_REQUIRES; fi
 
       # prime-kernels' own version carries the ABI it was built against (the other
       # wheels keep their upstream `+<rev>` naming; the release tag they are attached to
