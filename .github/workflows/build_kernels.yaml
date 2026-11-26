@@ -2,11 +2,13 @@ name: Build and Release Kernels
 
 # Builds every wheel prime-rl (and other consumers) pin via `[tool.uv.sources]`:
 # prime-kernels (this repo's own kernels.toml-declared extensions), deep-ep and
-# deep-select (from their pinned deepseek-ai revs), and our torchao (from the pytorch/ao
-# rev the MXFP8 training path requires). This repo is the single build+release site for
-# all four — prime-rl only consumes the resulting release, it does not build anything
-# itself (see scripts/install_ep_kernels.sh, scripts/install_deep_select.sh,
-# scripts/build_torchao.sh for the pinned revs).
+# deep-select (from their pinned deepseek-ai revs), our torchao (from the pytorch/ao
+# rev the MXFP8 training path requires), and modelexpress-server (the ModelExpress
+# server and Valkey binaries, built in the `build-modelexpress-server` job). This repo
+# is the single build+release site for all five — prime-rl only consumes the resulting
+# release, it does not build anything itself (see scripts/install_ep_kernels.sh,
+# scripts/install_deep_select.sh, scripts/build_torchao.sh and
+# scripts/build_modelexpress_server.sh for the pinned revs).
 #
 # Matrix: {kernel} x {arch: x86_64, aarch64}, all built against CUDA 13.0 (matches the
 # driver on our Blackwell fleet; see CUDA_TAG below). TORCH_CUDA_ARCH_LIST is set
@@ -42,6 +44,8 @@ on:
       - "scripts/install_ep_kernels.sh"
       - "scripts/install_deep_select.sh"
       - "scripts/build_torchao.sh"
+      - "scripts/build_modelexpress_server.sh"
+      - "scripts/pack_bin_wheel.py"
       - "scripts/smoke_test.py"
       - "pyproject.toml"
       - ".github/workflows/build_kernels.yaml"
@@ -51,6 +55,8 @@ on:
       - "scripts/install_ep_kernels.sh"
       - "scripts/install_deep_select.sh"
       - "scripts/build_torchao.sh"
+      - "scripts/build_modelexpress_server.sh"
+      - "scripts/pack_bin_wheel.py"
       - "scripts/smoke_test.py"
       - "pyproject.toml"
       - ".github/workflows/build_kernels.yaml"
@@ -195,6 +201,68 @@ jobs:
           path: dist/*.whl
           if-no-files-found: error
 
+  # The ModelExpress server and Valkey are plain Rust and C executables: no torch, no CUDA.
+  # PyPA's manylinux_2_28 image gives them the same glibc floor as the wheels above.
+  build-modelexpress-server:
+    name: Build modelexpress-server (${{ matrix.arch }})
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - arch: x86_64
+            runner: image-builder
+          - arch: aarch64
+            runner: image-builder-arm-2204
+    runs-on: ${{ matrix.runner }}
+    container: quay.io/pypa/manylinux_2_28_${{ matrix.arch }}
+    env:
+      PROTOC_VERSION: "29.3"
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v5
+
+      - name: Install Rust and protoc
+        run: |
+          curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --profile minimal --no-modify-path
+          echo "$HOME/.cargo/bin" >> "$GITHUB_PATH"
+          case "${{ matrix.arch }}" in
+            x86_64) PROTOC_ARCH=x86_64 ;;
+            aarch64) PROTOC_ARCH=aarch_64 ;;
+          esac
+          curl --fail --location --silent --show-error --output /tmp/protoc.zip \
+            "https://github.com/protocolbuffers/protobuf/releases/download/v${PROTOC_VERSION}/protoc-${PROTOC_VERSION}-linux-${PROTOC_ARCH}.zip"
+          /opt/python/cp312-cp312/bin/python -c "import sys, zipfile; zipfile.ZipFile(sys.argv[1]).extractall(sys.argv[2])" /tmp/protoc.zip /opt/protoc
+          chmod +x /opt/protoc/bin/protoc
+          echo "/opt/protoc/bin" >> "$GITHUB_PATH"
+          echo "/opt/python/cp312-cp312/bin" >> "$GITHUB_PATH"
+
+      - name: Build modelexpress-server wheel
+        run: bash scripts/build_modelexpress_server.sh --wheel-dir dist
+
+      # Install the wheel, then start Valkey and the server from the environment's bin directory
+      # the way prime-rl does, and wait for the server's gRPC port.
+      - name: Smoke test
+        run: |
+          python -m venv /tmp/test-env
+          /tmp/test-env/bin/pip install --quiet dist/*.whl
+          /tmp/test-env/bin/valkey-server --version
+          /tmp/test-env/bin/valkey-server --port 6390 --bind 127.0.0.1 --save "" --appendonly no --daemonize yes
+          MX_METADATA_BACKEND=redis REDIS_URL=redis://127.0.0.1:6390 \
+            /tmp/test-env/bin/modelexpress-server --port 8091 --metrics-port 0 --cache-directory /tmp/mx-cache &
+          for _ in $(seq 1 30); do
+            timeout 1 bash -c "echo > /dev/tcp/127.0.0.1/8091" 2>/dev/null && { echo "modelexpress-server is listening"; exit 0; }
+            sleep 1
+          done
+          echo "modelexpress-server did not listen on 8091" >&2
+          exit 1
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: modelexpress-server-${{ matrix.arch }}
+          path: dist/*.whl
+          if-no-files-found: error
+
   smoke-test:
     name: Smoke test ${{ matrix.kernel }}
     needs: build
@@ -248,7 +316,7 @@ jobs:
 
   release:
     name: Publish release
-    needs: [build, smoke-test]
+    needs: [build, build-modelexpress-server, smoke-test]
     # Only cut a real release on push-to-main or an explicit manual dispatch — a PR
     # should build and smoke-test, not publish. Without this, every push to a PR branch
     # would create and publish a real release the moment build+smoke-test go green.
@@ -269,7 +337,7 @@ jobs:
     # own explicit tolerance for 'skipped' ever got evaluated. Verified empirically:
     # https://github.com/PrimeIntellect-ai/prime-kernels/actions/runs/33123947708
     # (four variants raced side by side; only the always()-prefixed one ran).
-    if: ${{ always() && github.event_name != 'pull_request' && needs.build.result == 'success' && (needs['smoke-test'].result == 'success' || needs['smoke-test'].result == 'skipped') }}
+    if: ${{ always() && github.event_name != 'pull_request' && needs.build.result == 'success' && needs['build-modelexpress-server'].result == 'success' && (needs['smoke-test'].result == 'success' || needs['smoke-test'].result == 'skipped') }}
     runs-on: ubuntu-latest
     permissions:
       contents: write
