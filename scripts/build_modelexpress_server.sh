@@ -7,8 +7,8 @@
 # in its environment. The server's in-memory backend does not implement the weight-version (Refit)
 # API that RL weight updates use, so the wheel also ships Valkey, the BSD-licensed Redis fork.
 #
-# Pins: the MX rev must match the `modelexpress` client prime-rl pins (0.8.0.dev20261022 is the
-# nightly built from 446feec), and the wheel takes that client's version.
+# Pins: the MX rev must match the `modelexpress` client prime-rl pins (MX_REF is the v0.8.0 tag),
+# and the wheel takes that client's version.
 #
 # Usage:
 #   bash scripts/build_modelexpress_server.sh --wheel-dir dist
@@ -20,8 +20,8 @@ set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(dirname "$SCRIPT_DIR")"
 
-MX_REF="446feecd33dafec3f5e8c7becab4d72894bb9640"
-WHEEL_VERSION="0.8.0.dev20261022"
+MX_REF="fd606d605178db96706bfd48f50851c744501a1d"
+WHEEL_VERSION="0.8.0"
 VALKEY_VERSION="8.1.12"
 VALKEY_SHA256="675bd143a4c42022f7ce10fb012a7a61e0a70b139ff166e3e63fca2bdf05027b"
 WHEEL_DIR="$REPO_ROOT/dist"
